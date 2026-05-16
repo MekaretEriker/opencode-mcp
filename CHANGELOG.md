@@ -201,7 +201,4 @@ the wire protocol or tool surface — drop-in replacement for `opencode-mcp@1.10
 
 ### Changed
 
-- `opencode_find_file` tool: renamed the search-root override parameter from `directory` to `searchDirectory` to avoid collision with the new project-scoping `directory` parameter
-- Auth tools (`opencode_auth_set`, `opencode_provider_oauth_authorize`, `opencode_provider_oauth_callback`) do not accept `directory` — auth credentials are global, not project-scoped
-
-## [
+- `opencode_find_file` tool: renamed the search-root override parameter from `directory` to `searchDirectory` to avoid collision with t
