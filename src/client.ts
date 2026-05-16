@@ -58,6 +58,43 @@ const BASE_DELAY_MS = 500;
 /** Max reconnection attempts per MCP session lifetime. */
 const MAX_RECONNECT_ATTEMPTS = 3;
 
+/**
+ * HTTP methods that are idempotent and safe to retry. Non-idempotent methods
+ * (POST, PUT, PATCH) are excluded because if the server already received and
+ * processed the request but couldn't return a response in time, retrying
+ * creates duplicate state — e.g. duplicate user messages in an OpenCode
+ * session queue. See MEK-281.
+ */
+const SAFE_TO_RETRY_METHODS = new Set(["GET", "HEAD", "OPTIONS", "DELETE"]);
+
+/**
+ * Paths that should NEVER be retried regardless of method, because they
+ * trigger queue-pollution server-side. POST to these paths is the canonical
+ * case of MEK-281 (4 duplicate prompts after a client timeout). DELETE on the
+ * same paths is included defensively, although it's idempotent at the entity
+ * level it can race with concurrent writes from another caller.
+ */
+const UNSAFE_RETRY_PATHS: RegExp[] = [
+  /\/session\/[^/]+\/message$/,
+  /\/session\/[^/]+\/prompt_async$/,
+];
+
+/**
+ * Decide whether a (method, path) combination is safe to retry after a
+ * network/abort error or a transient HTTP error (429/502/503/504).
+ * Defaults to false (= don't retry) when in doubt.
+ */
+function isSafeToRetry(method: string, path: string): boolean {
+  const upper = method.toUpperCase();
+  if (!SAFE_TO_RETRY_METHODS.has(upper)) {
+    return false;
+  }
+  if (UNSAFE_RETRY_PATHS.some((re) => re.test(path))) {
+    return false;
+  }
+  return true;
+}
+
 /** Check if an error looks like a connection failure (server unreachable). */
 function isConnectionError(err: Error): boolean {
   const msg = err.message.toLowerCase();
@@ -168,7 +205,7 @@ export class OpenCodeClient {
             path,
             text,
           );
-          if (err.isTransient && attempt < MAX_RETRIES) {
+          if (err.isTransient && attempt < MAX_RETRIES && isSafeToRetry(method, path)) {
             lastError = err;
             continue;
           }
@@ -189,7 +226,11 @@ export class OpenCodeClient {
       } catch (e) {
         if (e instanceof OpenCodeError) throw e;
         lastError = e as Error;
-        if (attempt >= MAX_RETRIES) break;
+        // MEK-281: don't retry POST/PUT/PATCH on network errors — the server
+        // may have already received and processed the request, so retrying
+        // creates duplicate state. Same for /session/.../message even on
+        // safe methods.
+        if (!isSafeToRetry(method, path) || attempt >= MAX_RETRIES) break;
       }
     }
 

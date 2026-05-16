@@ -308,6 +308,63 @@ describe("OpenCodeClient", () => {
       expect(result).toEqual({ ok: true });
       expect(fetchMock).toHaveBeenCalledTimes(2);
     });
+
+    // MEK-281 — method-aware retry: POST/PUT/PATCH must not retry on network
+    // errors because the server may have already received and processed the
+    // request. Retrying would create duplicate state (e.g. duplicate prompts
+    // in a session message queue).
+
+    it("does NOT retry POST on network errors (MEK-281)", async () => {
+      fetchMock.mockRejectedValue(new Error("fetch failed"));
+
+      const client = createClient();
+      await expect(
+        client.post("/session/ses_test/message", { parts: [{ type: "text", text: "hi" }] })
+      ).rejects.toThrow(/fetch failed/);
+      // Only 1 attempt — no retries on POST
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT retry PATCH on AbortError (MEK-281)", async () => {
+      const abortErr = new Error("The user aborted a request.");
+      abortErr.name = "AbortError";
+      fetchMock.mockRejectedValue(abortErr);
+
+      const client = createClient();
+      await expect(
+        client.patch("/config", { key: "val" })
+      ).rejects.toThrow(/aborted/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT retry POST on transient 503 (MEK-281 defense-in-depth)", async () => {
+      fetchMock.mockResolvedValue({
+        ok: false,
+        status: 503,
+        headers: new Map(),
+        text: () => Promise.resolve("Service unavailable"),
+      });
+
+      const client = createClient();
+      await expect(
+        client.post("/session/ses_test/message", { parts: [{ type: "text", text: "hi" }] })
+      ).rejects.toThrow(OpenCodeError);
+      // Even though 503 is transient, POST is not safe to retry — server may
+      // have queued the message before failing to respond.
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT retry DELETE on /session/.../message path (MEK-281 path bypass)", async () => {
+      fetchMock.mockRejectedValue(new Error("fetch failed"));
+
+      const client = createClient();
+      // DELETE is normally safe to retry, but /session/.../message paths are
+      // blacklisted defensively because they touch the message queue.
+      await expect(
+        client.delete("/session/ses_test/message")
+      ).rejects.toThrow(/fetch failed/);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
   });
 
   describe("headers", () => {

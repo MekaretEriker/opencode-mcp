@@ -9,6 +9,20 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.10.2-mekareteriker.1] - 2026-05-16
+
+### Fixed
+
+- `[fork]` **MEK-281 — Destructive retry on POST/PUT/PATCH eliminated.** The wrapper's retry loop (`src/client.ts:140-235`) now distinguishes idempotent from non-idempotent HTTP methods. Network errors (AbortError, ECONNRESET, fetch failed, etc.) and transient HTTP errors (429/502/503/504) on POST/PUT/PATCH no longer trigger automatic retries — the server may have already received and processed the request, and retrying would create duplicate state (e.g. duplicate user messages in an OpenCode session queue, which is the observed "4 copies of the same prompt" symptom).
+  - New `SAFE_TO_RETRY_METHODS = {GET, HEAD, OPTIONS, DELETE}` set.
+  - New `UNSAFE_RETRY_PATHS` regex list blacklisting `/session/.../message` and `/session/.../prompt_async` even for safe methods (defense-in-depth).
+  - New `isSafeToRetry(method, path)` helper applied to both the transient-HTTP-error branch and the network/abort-error branch of the retry loop.
+  - 4 regression tests added in `tests/client.test.ts`.
+
+### Patches pending upstream
+
+- This is fork-only. Upstream `AlaeddineMessadi/opencode-mcp` is unmaintained (last release `v1.10.1` 2026-04-10, maintainer unresponsive). No PR submitted.
+
 ## [1.10.2-mekareteriker.0] - 2026-05-16
 
 First release of the `@mekareteriker/opencode-mcp` fork. Re-publishes upstream `main` HEAD
