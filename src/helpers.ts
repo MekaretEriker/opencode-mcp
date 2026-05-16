@@ -81,26 +81,84 @@ export function applyModelDefaults(
 // ── Directory Validation ─────────────────────────────────────────────
 
 /**
+ * Translate a Windows absolute path to its WSL equivalent.
+ *   `C:\Users\foo` → `/mnt/c/Users/foo`
+ *   `D:\Projects\opencode-mcp` → `/mnt/d/Projects/opencode-mcp`
+ *
+ * Pure string translation, no I/O. Returns the input unchanged if it
+ * doesn't match a Windows drive-letter pattern. See MEK-289.
+ */
+export function windowsToWslPath(p: string): string {
+  const m = /^([A-Za-z]):[\\/](.*)$/.exec(p);
+  if (!m) return p;
+  const [, drive, rest] = m;
+  return `/mnt/${drive.toLowerCase()}/${rest.replace(/\\/g, "/")}`;
+}
+
+/**
+ * Translate a WSL-style path to Windows form.
+ *   `/mnt/c/Users/foo` → `C:\Users\foo`
+ *   `/mnt/d/Projects/foo` → `D:\Projects\foo`
+ *
+ * Pure string translation, no I/O. Returns the input unchanged if it
+ * doesn't match the `/mnt/<drive>/...` pattern. See MEK-289.
+ */
+export function wslToWindowsPath(p: string): string {
+  const m = /^\/mnt\/([a-z])\/(.*)$/.exec(p);
+  if (!m) return p;
+  const [, drive, rest] = m;
+  return `${drive.toUpperCase()}:\\${rest.replace(/\//g, "\\")}`;
+}
+
+/**
+ * Translation mode for the directory header sent to the OpenCode server.
+ * Configurable via env `OPENCODE_MCP_TRANSLATE_PATHS`:
+ *   - `wsl`  : always translate Windows-style paths to `/mnt/<drive>/...`
+ *   - `none` : never translate, ship the path as-is (legacy behavior)
+ *   - `auto` (default) : translate iff the client process runs on Windows
+ *
+ * Default `auto` covers the most common Cowork deployment shape
+ * (Cowork-on-Windows + OpenCode-in-WSL). See MEK-289.
+ */
+type PathTranslateMode = "wsl" | "none" | "auto";
+
+function getPathTranslateMode(): PathTranslateMode {
+  const v = process.env.OPENCODE_MCP_TRANSLATE_PATHS?.toLowerCase();
+  if (v === "wsl" || v === "none" || v === "auto") return v as PathTranslateMode;
+  return "auto";
+}
+
+/**
  * Normalize and validate a directory path:
+ *  - Accepts both POSIX and Windows absolute paths from the user
+ *  - If client runs on Windows and a WSL-style input is provided, translates
+ *    it to Windows form *before* local validation (existsSync on Windows
+ *    cannot see `/mnt/d/...` directly)
  *  - Resolves to absolute (handles "..", ".", trailing slashes, and
  *    converts relative inputs against `process.cwd()`)
  *  - Confirms the resolved path is absolute for the current platform
  *  - Validates that the path exists on disk
+ *  - Per `OPENCODE_MCP_TRANSLATE_PATHS` (default `auto`), translates the
+ *    validated path to WSL form before returning, so the OpenCode server
+ *    running in WSL/Linux receives a path it can actually use as cwd
  *
- * Accepts both POSIX ("/home/user/my-project") and Windows
- * ("C:\\Users\\me\\my-project", "\\\\server\\share") absolute paths via
- * the platform-aware `resolve` + `isAbsolute` from `node:path`.
- *
- * Returns the normalized path, or undefined if input was undefined.
- * Throws a descriptive Error on validation failure.
+ * Returns the normalized path (in the form the server expects), or
+ * undefined if input was undefined. Throws a descriptive Error on
+ * validation failure.
  */
 export function normalizeDirectory(directory?: string): string | undefined {
   if (!directory) return undefined;
 
+  // Accept WSL paths even on Windows clients. `existsSync` on Windows
+  // can't see `/mnt/d/...` but can see `D:\...` — translate WSL → Windows
+  // BEFORE local validation. MEK-289.
+  const inputForValidation =
+    process.platform === "win32" ? wslToWindowsPath(directory) : directory;
+
   // Resolve to an absolute, platform-appropriate form. `resolve` handles
   // "..", ".", trailing slashes, and will convert a relative input against
   // `process.cwd()`.
-  const normalized = resolve(directory);
+  const normalized = resolve(inputForValidation);
 
   // Defensive check: `resolve` guarantees an absolute path on every
   // supported platform, but we verify via the platform-aware `isAbsolute`
@@ -121,7 +179,17 @@ export function normalizeDirectory(directory?: string): string | undefined {
     );
   }
 
-  return normalized;
+  // For the OpenCode server, translate Windows paths to WSL when required.
+  // MEK-289 fix: previously the Windows path was shipped as-is in the
+  // `x-opencode-directory` header, where a Linux server would `path.join`
+  // it onto its cwd producing nonsense like
+  // `/mnt/d/Projects/agent/D:\Projects\foo` — every subsequent tool call
+  // that touched the filesystem silent-failed.
+  const mode = getPathTranslateMode();
+  const shouldTranslate =
+    mode === "wsl" || (mode === "auto" && process.platform === "win32");
+
+  return shouldTranslate ? windowsToWslPath(normalized) : normalized;
 }
 
 /**

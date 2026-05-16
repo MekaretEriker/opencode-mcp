@@ -15,6 +15,8 @@ import {
   setModelDefaults,
   applyModelDefaults,
   normalizeDirectory,
+  windowsToWslPath,
+  wslToWindowsPath,
   toolResult,
   toolError,
   toolJson,
@@ -891,6 +893,19 @@ describe("applyModelDefaults", () => {
 // ─── normalizeDirectory ──────────────────────────────────────────────────
 
 describe("normalizeDirectory", () => {
+  // MEK-289: pin translation OFF for these legacy tests so they assert
+  // the validation-only behavior (path round-trips unchanged). Translation
+  // is exercised in its own describe block below.
+  let _savedTranslate: string | undefined;
+  beforeEach(() => {
+    _savedTranslate = process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    process.env.OPENCODE_MCP_TRANSLATE_PATHS = "none";
+  });
+  afterEach(() => {
+    if (_savedTranslate === undefined) delete process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    else process.env.OPENCODE_MCP_TRANSLATE_PATHS = _savedTranslate;
+  });
+
   it("returns undefined for undefined input", () => {
     expect(normalizeDirectory(undefined)).toBeUndefined();
   });
@@ -951,6 +966,125 @@ describe("normalizeDirectory", () => {
       const result = normalizeDirectory(cwd);
       expect(result).toBeDefined();
       expect(result).toMatch(/^[A-Za-z]:\\/);
+    },
+  );
+});
+
+// ─── MEK-289 — WSL ↔ Windows path translation ───────────────────────────
+
+describe("windowsToWslPath", () => {
+  it("translates a typical Windows drive-letter path", () => {
+    expect(windowsToWslPath("C:\\Users\\foo")).toBe("/mnt/c/Users/foo");
+  });
+
+  it("lowercases the drive letter", () => {
+    expect(windowsToWslPath("D:\\Projects\\opencode-mcp"))
+      .toBe("/mnt/d/Projects/opencode-mcp");
+  });
+
+  it("accepts forward-slash Windows paths (mixed style)", () => {
+    expect(windowsToWslPath("D:/Projects/foo")).toBe("/mnt/d/Projects/foo");
+  });
+
+  it("returns POSIX input unchanged (no double translation)", () => {
+    expect(windowsToWslPath("/home/user/foo")).toBe("/home/user/foo");
+  });
+
+  it("returns an already-WSL path unchanged (idempotent on non-Windows)", () => {
+    expect(windowsToWslPath("/mnt/d/Projects/foo")).toBe("/mnt/d/Projects/foo");
+  });
+});
+
+describe("wslToWindowsPath", () => {
+  it("translates a typical /mnt/<drive>/... path", () => {
+    expect(wslToWindowsPath("/mnt/c/Users/foo")).toBe("C:\\Users\\foo");
+  });
+
+  it("uppercases the drive letter", () => {
+    expect(wslToWindowsPath("/mnt/d/Projects/opencode-mcp"))
+      .toBe("D:\\Projects\\opencode-mcp");
+  });
+
+  it("returns a non-mnt POSIX path unchanged", () => {
+    expect(wslToWindowsPath("/home/user/foo")).toBe("/home/user/foo");
+  });
+
+  it("returns a Windows path unchanged", () => {
+    expect(wslToWindowsPath("C:\\Users\\foo")).toBe("C:\\Users\\foo");
+  });
+
+  it("round-trips with windowsToWslPath", () => {
+    const win = "D:\\Projects\\opencode-mcp";
+    expect(wslToWindowsPath(windowsToWslPath(win))).toBe(win);
+  });
+});
+
+describe("normalizeDirectory with WSL translation (MEK-289)", () => {
+  let _savedTranslate: string | undefined;
+  beforeEach(() => {
+    _savedTranslate = process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+  });
+  afterEach(() => {
+    if (_savedTranslate === undefined) delete process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    else process.env.OPENCODE_MCP_TRANSLATE_PATHS = _savedTranslate;
+  });
+
+  // The Windows-shape test requires a real Windows path that exists on disk.
+  // On a Windows runner, process.cwd() satisfies that. On non-Windows we
+  // skip — the dual translation only kicks in on Windows clients anyway.
+  it.runIf(process.platform === "win32")(
+    "with mode=wsl, translates Windows path to /mnt/<drive>/... form",
+    () => {
+      process.env.OPENCODE_MCP_TRANSLATE_PATHS = "wsl";
+      const cwd = process.cwd(); // e.g. "C:\\Users\\runner\\work\\..."
+      const result = normalizeDirectory(cwd);
+      expect(result).toBeDefined();
+      expect(result).toMatch(/^\/mnt\/[a-z]\//);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "with mode=auto on Windows, translates by default (the headline MEK-289 fix)",
+    () => {
+      delete process.env.OPENCODE_MCP_TRANSLATE_PATHS; // auto
+      const cwd = process.cwd();
+      const result = normalizeDirectory(cwd);
+      expect(result).toMatch(/^\/mnt\/[a-z]\//);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "with mode=none on Windows, preserves legacy behavior (no translation)",
+    () => {
+      process.env.OPENCODE_MCP_TRANSLATE_PATHS = "none";
+      const cwd = process.cwd();
+      const result = normalizeDirectory(cwd);
+      expect(result).toMatch(/^[A-Za-z]:\\/);
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "accepts WSL-shaped input on Windows clients (translated back for validation)",
+    () => {
+      process.env.OPENCODE_MCP_TRANSLATE_PATHS = "wsl";
+      // Build a WSL form of process.cwd() so we know it exists.
+      const cwd = process.cwd();
+      const wslInput = windowsToWslPath(cwd);
+      expect(wslInput).toMatch(/^\/mnt\/[a-z]\//);
+      const result = normalizeDirectory(wslInput);
+      // Translated back out to WSL form for the server.
+      expect(result).toMatch(/^\/mnt\/[a-z]\//);
+    },
+  );
+
+  // POSIX-side sanity: on Linux/macOS, mode=auto should NOT translate
+  // (server is local POSIX too, no WSL bridge to cross).
+  it.skipIf(process.platform === "win32")(
+    "with mode=auto on POSIX, does not translate (no bridge to cross)",
+    () => {
+      delete process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+      const result = normalizeDirectory(TMP);
+      expect(result).toBe(TMP);
     },
   );
 });

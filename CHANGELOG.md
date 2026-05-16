@@ -11,8 +11,30 @@ Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
 ## [Unreleased] — target `1.11.0-mekareteriker.0`
 
-Batched release covering MEK-282, MEK-283, MEK-284. Will bump to `1.11.0-mekareteriker.0`
+Batched release covering MEK-282, MEK-283, MEK-284, MEK-289. Will bump to `1.11.0-mekareteriker.0`
 (minor — adds the new `opencode_run_streaming` tool from MEK-283).
+
+### Fixed
+
+- `[fork]` **MEK-289 — WSL ↔ Windows path translation for cross-platform dispatch.**
+  `normalizeDirectory` (`src/helpers.ts`) now translates between Windows and WSL path forms
+  so the OpenCode server (typically running under WSL/Linux) actually receives a path it can
+  use as cwd when the wrapper runs on Windows (typical Cowork deployment shape). Previously
+  the validated Windows path was shipped as-is in the `x-opencode-directory` header where the
+  Linux server would `path.join(serverCwd, "D:\Projects\...")` producing nonsense like
+  `/mnt/d/Projects/agent/D:\Projects\opencode-mcp` — every subsequent `read`/`bash`/`write`
+  silent-failed, with `cost: $0.0000` because the session aborted before the model call in
+  some cases. Symptom in the wild: empty assistant responses on any dispatch involving tool
+  use. Reproduced during the MEK-282 dogfood on 2026-05-16.
+  - New `windowsToWslPath()` / `wslToWindowsPath()` pure helpers (no I/O).
+  - New env `OPENCODE_MCP_TRANSLATE_PATHS=wsl|none|auto` (default `auto` = translate iff
+    `process.platform === "win32"`).
+  - `normalizeDirectory` now also accepts WSL-style input (`/mnt/d/...`) on Windows clients
+    by translating to Windows form for local `existsSync` validation, so both shapes work.
+  - 14 new tests in `tests/helpers.test.ts` (10 for the pure helpers, 4 for translation
+    behavior — the 4 windows-only ones skip on POSIX runners).
+  - Existing `normalizeDirectory` tests now pin `OPENCODE_MCP_TRANSLATE_PATHS=none` via
+    `beforeEach` to assert legacy validation-only behavior.
 
 ### Added
 
