@@ -250,12 +250,13 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ prompt, title, providerID, modelID, variant, agent, system, directory }) => {
+      let sessionId: string | undefined;
       try {
         // 1. Create session
         const session = (await client.post("/session", {
           title: title ?? prompt.slice(0, 80),
         }, { directory })) as Record<string, unknown>;
-        const sessionId = session.id as string;
+        sessionId = session.id as string;
 
         // 2. Send prompt
         const body: Record<string, unknown> = {
@@ -285,7 +286,12 @@ export function registerWorkflowTools(
         }
         return toolResult(parts.join("\n\n"), analysis.hasError);
       } catch (e) {
-        return toolError(e);
+        const ctx: { providerID?: string; modelID?: string; sessionId?: string } = {
+          providerID,
+          modelID,
+        };
+        if (sessionId) ctx.sessionId = sessionId;
+        return toolError(e, ctx);
       }
     },
   );
@@ -334,7 +340,7 @@ export function registerWorkflowTools(
           analysis.hasError,
         );
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId });
       }
     },
   );
@@ -673,9 +679,9 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ prompt, sessionId, title, providerID, modelID, variant, agent, maxDurationSeconds, directory }) => {
+      let sid = sessionId;
       try {
         // 1. Create or reuse session
-        let sid = sessionId;
         if (!sid) {
           const session = (await client.post("/session", {
             title: title ?? prompt.slice(0, 80),
@@ -764,7 +770,7 @@ export function registerWorkflowTools(
           true,
         );
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId: sid });
       }
     },
   );
@@ -787,9 +793,9 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ prompt, sessionId, title, providerID, modelID, variant, agent, directory }) => {
+      let sid = sessionId;
       try {
         // 1. Create or reuse session
-        let sid = sessionId;
         if (!sid) {
           const session = (await client.post("/session", {
             title: title ?? prompt.slice(0, 80),
@@ -818,7 +824,7 @@ export function registerWorkflowTools(
           `- \`opencode_review_changes({sessionId: "${sid}"})\` — see file changes after completion`,
         );
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId: sid });
       }
     },
   );

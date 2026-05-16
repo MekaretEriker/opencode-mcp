@@ -9,6 +9,7 @@
 import { z } from "zod";
 import { existsSync } from "node:fs";
 import { isAbsolute, resolve } from "node:path";
+import { OpenCodeError } from "./client.js";
 
 /* eslint-disable @typescript-eslint/no-explicit-any */
 
@@ -428,6 +429,8 @@ export function analyzeMessageResponse(response: unknown): {
   isEmpty: boolean;
   hasError: boolean;
   warning: string | null;
+  tokenUsage?: { prompt?: number; completion?: number; reasoning?: number };
+  modelIdEffective?: string;
 } {
   if (response === null || response === undefined) {
     return {
@@ -443,6 +446,11 @@ export function analyzeMessageResponse(response: unknown): {
 
   const r = response as any;
   const parts = Array.isArray(r?.parts) ? r.parts : [];
+
+  // Extract token usage from step-finish parts (used on error paths)
+  const tokenUsage = extractTokenUsage(parts);
+  // Extract effective model ID from step-finish or part metadata
+  const modelIdEffective = extractModelIdEffective(parts);
 
   // Check for error parts
   const errorParts = parts.filter(
@@ -463,6 +471,8 @@ export function analyzeMessageResponse(response: unknown): {
         `The response contains an error: ${typeof firstError === "string" ? firstError : JSON.stringify(firstError)}. ` +
         "This may indicate an authentication issue. " +
         "Use `opencode_auth_set` to verify your API key.",
+      tokenUsage,
+      modelIdEffective,
     };
   }
 
@@ -480,10 +490,34 @@ export function analyzeMessageResponse(response: unknown): {
         "The AI returned a response with no text content. This usually means " +
         "the provider API key is missing or the model is unavailable. " +
         "Try a different provider/model, or use `opencode_auth_set` to configure credentials.",
+      tokenUsage,
+      modelIdEffective,
     };
   }
 
-  return { isEmpty: false, hasError: false, warning: null };
+  return { isEmpty: false, hasError: false, warning: null, tokenUsage, modelIdEffective };
+}
+
+function extractTokenUsage(parts: any[]) {
+  const stepFinish = parts.find(
+    (p: any) => p.type === "step-finish" && p.tokens,
+  );
+  if (!stepFinish?.tokens) return undefined;
+  const usage: { prompt?: number; completion?: number; reasoning?: number } = {};
+  if (stepFinish.tokens.input != null) usage.prompt = stepFinish.tokens.input;
+  if (stepFinish.tokens.output != null) usage.completion = stepFinish.tokens.output;
+  if (stepFinish.tokens.reasoning != null) usage.reasoning = stepFinish.tokens.reasoning;
+  return Object.keys(usage).length > 0 ? usage : undefined;
+}
+
+function extractModelIdEffective(parts: any[]): string | undefined {
+  const stepFinish = parts.find((p: any) => p.type === "step-finish");
+  if (stepFinish?.modelID) return stepFinish.modelID;
+  for (const p of parts) {
+    if (p.providerMetadata?.modelId) return p.providerMetadata.modelId;
+    if (p.model) return p.model;
+  }
+  return undefined;
 }
 
 /**
@@ -621,6 +655,170 @@ export function resolveSessionStatus(raw: unknown): string {
   return "unknown";
 }
 
+// ── Structured Error Surfacing (MEK-282) ──────────────────────────────
+
+export type StructuredErrorCode =
+  | "EMPTY_RESPONSE"
+  | "PROVIDER_ERROR"
+  | "TIMEOUT"
+  | "SESSION_HANG"
+  | "AUTH_FAILED"
+  | "RATE_LIMITED"
+  | "INVALID_DIRECTORY"
+  | "UNKNOWN";
+
+export interface StructuredError {
+  code: StructuredErrorCode;
+  message: string;
+  raw?: {
+    httpStatus?: number;
+    method?: string;
+    path?: string;
+    body?: string;
+    bodyJson?: unknown;
+    headers?: Record<string, string>;
+  };
+  provider?: string;
+  modelIdRequested?: string;
+  modelIdEffective?: string;
+  tokenUsage?: { prompt?: number; completion?: number; reasoning?: number };
+  sessionId?: string;
+  suggestedAction?: string;
+}
+
+export interface ErrorContext {
+  providerID?: string;
+  modelID?: string;
+  sessionId?: string;
+  responseParts?: unknown[];
+}
+
+function getSuggestedAction(code: StructuredErrorCode, message?: string): string | undefined {
+  switch (code) {
+    case "AUTH_FAILED":
+      return "Check credentials with opencode_provider_test, set key with opencode_auth_set";
+    case "RATE_LIMITED":
+      return "Wait and retry, or switch provider/model";
+    case "TIMEOUT":
+      return "Use opencode_run for complex tasks (handles polling automatically)";
+    case "PROVIDER_ERROR":
+      return "The provider returned an error. Check the body field for details.";
+    case "EMPTY_RESPONSE":
+      return "Provider returned no text. Check API key, model availability, or quota.";
+    case "INVALID_DIRECTORY":
+      return "Pass an absolute path to an existing directory.";
+    case "SESSION_HANG":
+      return "Try opencode_session_abort then retry.";
+    default:
+      return diagnoseUnknownSuggestion(message);
+  }
+}
+
+function diagnoseUnknownSuggestion(msg: string | undefined): string | undefined {
+  if (!msg) return undefined;
+  const lower = msg.toLowerCase();
+  if (lower.includes("econnrefused")) {
+    return "The OpenCode server is not accepting connections. Is `opencode serve` running? Check with `opencode_setup`. Verify OPENCODE_BASE_URL is correct (default: http://127.0.0.1:4096). The server will auto-reconnect on the next request if OPENCODE_AUTO_SERVE is enabled.";
+  }
+  if (lower.includes("enotfound") || lower.includes("ehostunreach")) {
+    return "Cannot reach the OpenCode server host. Check that OPENCODE_BASE_URL points to a reachable address. If running remotely, verify network connectivity.";
+  }
+  if (lower.includes("etimedout")) {
+    return "The server is not responding (connection timed out). The server may be overloaded or starting up — retry in a few seconds. Check with `opencode_setup` to verify server health.";
+  }
+  if (lower.includes("unreachable") || lower.includes("fetch failed")) {
+    return "Is `opencode serve` running? Check with `opencode_setup`. Verify OPENCODE_BASE_URL is correct (default: http://127.0.0.1:4096).";
+  }
+  if (lower.includes("session") && lower.includes("not found")) {
+    return "List active sessions with `opencode_sessions_overview`.";
+  }
+  return undefined;
+}
+
+export function buildStructuredError(e: unknown, ctx?: ErrorContext): StructuredError {
+  const message = e instanceof Error ? e.message : String(e);
+  const lower = message.toLowerCase();
+  let code: StructuredErrorCode;
+
+  if (e instanceof OpenCodeError) {
+    if (e.status === 401 || e.status === 403) code = "AUTH_FAILED";
+    else if (e.status === 429) code = "RATE_LIMITED";
+    else if (e.status >= 500) code = "PROVIDER_ERROR";
+    else code = "PROVIDER_ERROR";
+  } else if (
+    lower.includes("timeout") ||
+    lower.includes("timed out") ||
+    lower.includes("aborted") ||
+    lower.includes("etimedout")
+  ) {
+    code = "TIMEOUT";
+  } else if (lower.includes("no text content") || lower.includes("empty response")) {
+    code = "EMPTY_RESPONSE";
+  } else if (lower.includes("directory not found") || lower.includes("not an absolute path")) {
+    code = "INVALID_DIRECTORY";
+  } else if (
+    lower.includes("401") ||
+    lower.includes("403") ||
+    lower.includes("api key") ||
+    lower.includes("unauthorized") ||
+    lower.includes("forbidden")
+  ) {
+    code = "AUTH_FAILED";
+  } else if (lower.includes("rate limit") || lower.includes("429")) {
+    code = "RATE_LIMITED";
+  } else {
+    code = "UNKNOWN";
+  }
+
+  const result: StructuredError = { code, message };
+
+  if (e instanceof OpenCodeError) {
+    const raw: StructuredError["raw"] = {
+      httpStatus: e.status,
+      method: e.method,
+      path: e.path,
+      body: e.body,
+    };
+    try {
+      raw.bodyJson = JSON.parse(e.body);
+    } catch { /* not JSON — leave bodyJson undefined */ }
+    result.raw = raw;
+  }
+
+  if (ctx) {
+    if (ctx.providerID) result.provider = ctx.providerID;
+    if (ctx.modelID) result.modelIdRequested = ctx.modelID;
+    if (ctx.sessionId) result.sessionId = ctx.sessionId;
+    if (ctx.responseParts) {
+      const stepFinish = (ctx.responseParts as any[]).find(
+        (p: any) => p.type === "step-finish" && p.tokens,
+      );
+      if (stepFinish?.tokens) {
+        result.tokenUsage = {
+          prompt: stepFinish.tokens.input,
+          completion: stepFinish.tokens.output,
+          reasoning: stepFinish.tokens.reasoning,
+        };
+      }
+    }
+  }
+
+  result.suggestedAction = getSuggestedAction(code, message);
+
+  return result;
+}
+
+export function formatErrorHuman(structured: StructuredError): string {
+  let text = `Error [${structured.code}]: ${structured.message}`;
+  if (structured.raw?.httpStatus) {
+    text += ` (HTTP ${structured.raw.httpStatus})`;
+  }
+  if (structured.suggestedAction) {
+    text += `\n\n**Suggestion:** ${structured.suggestedAction}`;
+  }
+  return text;
+}
+
 /**
  * Standard tool response builder.
  */
@@ -631,58 +829,12 @@ export function toolResult(text: string, isError = false) {
   };
 }
 
-export function toolError(e: unknown) {
-  const msg = e instanceof Error ? e.message : String(e);
-  const suggestions = diagnoseError(msg);
-  const text = suggestions
-    ? `Error: ${msg}\n\n**Suggestions:**\n${suggestions}`
-    : `Error: ${msg}`;
+export function toolError(e: unknown, ctx?: ErrorContext) {
+  const structured = buildStructuredError(e, ctx);
+  const safeStructured = redactSecrets(structured) as StructuredError;
+  const human = formatErrorHuman(structured);
+  const text = `${human}\n\n<!-- structured-error\n${JSON.stringify(safeStructured, null, 2)}\n-->`;
   return toolResult(text, true);
-}
-
-/**
- * Analyze an error message and return contextual suggestions, or empty
- * string if no specific advice applies.  Keeps suggestions concise to
- * minimise token overhead.
- */
-function diagnoseError(msg: string): string {
-  const lower = msg.toLowerCase();
-  const tips: string[] = [];
-
-  if (lower.includes("api key") || lower.includes("401") || lower.includes("403") || lower.includes("unauthorized") || lower.includes("forbidden")) {
-    tips.push("- Check credentials with `opencode_provider_test`");
-    tips.push("- Set a key with `opencode_auth_set`");
-  } else if (lower.includes("timeout") || lower.includes("timed out") || lower.includes("aborted")) {
-    tips.push("- Use `opencode_run` for complex tasks (handles polling automatically)");
-    tips.push("- Or use `opencode_message_send_async` + `opencode_wait` for manual control");
-    tips.push("- Check session progress with `opencode_conversation`");
-  } else if (lower.includes("not found") && lower.includes("session")) {
-    tips.push("- List active sessions with `opencode_sessions_overview`");
-  } else if (lower.includes("rate limit") || lower.includes("429")) {
-    tips.push("- Wait a moment and retry, or switch provider");
-    tips.push("- Try a free model: `opencode_ask` with providerID `opencode`, modelID `minimax-m2.1-free`");
-  } else if (lower.includes("econnrefused")) {
-    tips.push("- The OpenCode server is not accepting connections");
-    tips.push("- Is `opencode serve` running? Check with `opencode_setup`");
-    tips.push("- Verify OPENCODE_BASE_URL is correct (default: http://127.0.0.1:4096)");
-    tips.push("- The server will auto-reconnect on the next request if OPENCODE_AUTO_SERVE is enabled");
-  } else if (lower.includes("enotfound") || lower.includes("ehostunreach")) {
-    tips.push("- Cannot reach the OpenCode server host");
-    tips.push("- Check that OPENCODE_BASE_URL points to a reachable address");
-    tips.push("- If running remotely, verify network connectivity");
-  } else if (lower.includes("etimedout")) {
-    tips.push("- The server is not responding (connection timed out)");
-    tips.push("- The server may be overloaded or starting up — retry in a few seconds");
-    tips.push("- Check with `opencode_setup` to verify server health");
-  } else if (lower.includes("unreachable") || lower.includes("fetch failed")) {
-    tips.push("- Is `opencode serve` running? Check with `opencode_setup`");
-    tips.push("- Verify OPENCODE_BASE_URL is correct (default: http://127.0.0.1:4096)");
-  } else if (lower.includes("directory not found") || lower.includes("not an absolute path")) {
-    tips.push("- The `directory` parameter must be an absolute path to an existing directory");
-    tips.push("- Example: `/home/user/my-project` (not `./my-project` or `~/my-project`)");
-  }
-
-  return tips.join("\n");
 }
 
 export function toolJson(value: unknown) {

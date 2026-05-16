@@ -16,6 +16,49 @@ Batched release covering MEK-282, MEK-283, MEK-284, MEK-289. Will bump to `1.11.
 
 ### Fixed
 
+- `[fork]` **MEK-282 — Structured error surfacing for downstream consumers.**
+  `toolError(e, ctx?)` now emits BOTH a human-readable line AND a machine-parsable JSON
+  payload embedded in an HTML comment (`<!-- structured-error ... -->`), MCP-compliant
+  (still a single `content[]` text part). Downstream clients (Cowork, other LLM wrappers)
+  can `JSON.parse` the block to decide how to retry / escalate without regex-matching the
+  error string. Symptom in the wild: a 429 from OpenRouter would surface as a vague
+  `Error: Rate limit exceeded` with no body / rate-limit headers / retry_after / effective
+  model — all of which `OpenCodeError` already had on hand but `toolError` was throwing
+  away. With this fix, every error now exposes a `StructuredError` with `code`, `raw.body`,
+  `raw.bodyJson`, `provider`, `modelIdRequested`, `tokenUsage`, `sessionId`, and a
+  per-code `suggestedAction`.
+  - New types: `StructuredError`, `StructuredErrorCode` (8 codes: `EMPTY_RESPONSE`,
+    `PROVIDER_ERROR`, `TIMEOUT`, `SESSION_HANG`, `AUTH_FAILED`, `RATE_LIMITED`,
+    `INVALID_DIRECTORY`, `UNKNOWN`), `ErrorContext`.
+  - New helpers: `buildStructuredError(e, ctx?)`, `formatErrorHuman(structured)`,
+    `extractTokenUsage(parts)`, `extractModelIdEffective(parts)`,
+    `getSuggestedAction(code, message?)`, `diagnoseUnknownSuggestion(message)`.
+  - Classification: `OpenCodeError` → status-based (401/403 → `AUTH_FAILED`, 429 →
+    `RATE_LIMITED`, 5xx → `PROVIDER_ERROR`); other `Error` → regex on message (timeout,
+    empty response, invalid directory, auth, rate limit) with `UNKNOWN` fallback.
+  - `raw.body` is shipped as-is plus a best-effort `bodyJson` via silent `JSON.parse`.
+  - `redactSecrets` is applied to the full structured payload BEFORE serialisation, so any
+    tokens leaked by a provider in `raw.body` / `raw.headers` are redacted in the JSON
+    block (the human-readable line never includes `raw.body` at all).
+  - Ctx threading: `{ providerID, modelID, sessionId, responseParts? }` is OPTIONAL. The
+    ~75 file-ops / TUI / setup call sites still call `toolError(e)` and keep emitting a
+    valid structured block with the ctx fields undefined.
+  - 8 prompt-dispatch call sites now thread ctx end-to-end:
+    `src/tools/message.ts` × 4 (`opencode_message_send`, `opencode_message_send_async`,
+    `opencode_command_execute`, `opencode_shell_execute`) and `src/tools/workflow.ts` × 4
+    (`opencode_ask`, `opencode_reply`, `opencode_run`, `opencode_fire`). For
+    session-creating tools (`ask` / `run` / `fire`), `sessionId` is declared above the
+    `try` block so the catch sees it even if the error fires before session creation.
+  - `analyzeMessageResponse` now exposes `tokenUsage?` and `modelIdEffective?` (OPTIONAL,
+    backward compatible). Extracted from `step-finish` parts (input → `tokenUsage.prompt`,
+    output → `tokenUsage.completion`, reasoning → `tokenUsage.reasoning`).
+  - Removed the now-obsolete `diagnoseError(msg)` regex-tip generator; its patterns are
+    preserved in `diagnoseUnknownSuggestion` for the `UNKNOWN` code path so behavior is
+    unchanged for unclassified errors.
+  - 2 new regression tests in `tests/helpers.test.ts` (429 OpenCodeError → full structured
+    block, empty response → tokenUsage extraction). Existing `toolError` tests adapted to
+    the new `Error [CODE]: msg` format.
+
 - `[fork]` **MEK-289 — WSL ↔ Windows path translation for cross-platform dispatch.**
   `normalizeDirectory` (`src/helpers.ts`) now translates between Windows and WSL path forms
   so the OpenCode server (typically running under WSL/Linux) actually receives a path it can

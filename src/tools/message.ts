@@ -127,7 +127,7 @@ export function registerMessageTools(
           analysis.hasError,
         );
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId });
       }
     },
   );
@@ -163,7 +163,7 @@ export function registerMessageTools(
           "Message sent asynchronously. Use opencode_wait or opencode_message_list to check for responses.",
         );
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId });
       }
     },
   );
@@ -211,7 +211,7 @@ export function registerMessageTools(
         );
         return toolResult(formatMessageResponse(result));
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId });
       }
     },
   );
@@ -240,7 +240,7 @@ export function registerMessageTools(
         );
         return toolResult(formatMessageResponse(result));
       } catch (e) {
-        return toolError(e);
+        return toolError(e, { providerID, modelID, sessionId });
       }
     },
   );

@@ -1,5 +1,6 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
 import { tmpdir } from "node:os";
+import { OpenCodeError } from "../src/client.js";
 
 const TMP = tmpdir();
 import {
@@ -673,40 +674,42 @@ describe("toolResult", () => {
 describe("toolError", () => {
   it("extracts message from Error instances", () => {
     const result = toolError(new Error("something broke"));
-    expect(result.content[0].text).toContain("Error: something broke");
+    expect(result.content[0].text).toContain("Error [UNKNOWN]: something broke");
+    expect(result.content[0].text).toContain("<!-- structured-error");
     expect(result.isError).toBe(true);
   });
 
   it("converts non-Error values to string", () => {
     const result = toolError("string error");
-    expect(result.content[0].text).toContain("Error: string error");
+    expect(result.content[0].text).toContain("Error [UNKNOWN]: string error");
+    expect(result.content[0].text).toContain("<!-- structured-error");
   });
 
   it("handles numbers", () => {
     const result = toolError(404);
-    expect(result.content[0].text).toContain("Error: 404");
+    expect(result.content[0].text).toContain("Error [UNKNOWN]: 404");
   });
 
   // ── Auto-suggestion tests ──────────────────────────────────────────
 
   it("suggests auth fix for 401 errors", () => {
     const result = toolError(new Error("Request failed with status 401"));
-    expect(result.content[0].text).toContain("Suggestions");
+    expect(result.content[0].text).toContain("**Suggestion:**");
     expect(result.content[0].text).toContain("opencode_provider_test");
     expect(result.content[0].text).toContain("opencode_auth_set");
   });
 
   it("suggests auth fix for API key errors", () => {
     const result = toolError(new Error("Invalid API key provided"));
-    expect(result.content[0].text).toContain("Suggestions");
+    expect(result.content[0].text).toContain("**Suggestion:**");
     expect(result.content[0].text).toContain("opencode_auth_set");
   });
 
   it("suggests async pattern for timeout errors", () => {
     const result = toolError(new Error("Request timed out after 120s"));
-    expect(result.content[0].text).toContain("Suggestions");
-    expect(result.content[0].text).toContain("opencode_message_send_async");
-    expect(result.content[0].text).toContain("opencode_conversation");
+    expect(result.content[0].text).toContain("**Suggestion:**");
+    expect(result.content[0].text).toContain("opencode_run");
+    expect(result.content[0].text).toContain("Error [TIMEOUT]");
   });
 
   it("suggests session list for session not found", () => {
@@ -716,8 +719,8 @@ describe("toolError", () => {
 
   it("suggests rate limit workaround for 429 errors", () => {
     const result = toolError(new Error("Rate limit exceeded (429)"));
-    expect(result.content[0].text).toContain("Suggestions");
-    expect(result.content[0].text).toContain("minimax-m2.1-free");
+    expect(result.content[0].text).toContain("**Suggestion:**");
+    expect(result.content[0].text).toContain("Error [RATE_LIMITED]");
   });
 
   it("suggests server check for connection errors", () => {
@@ -727,8 +730,8 @@ describe("toolError", () => {
 
   it("does not add suggestions for generic errors", () => {
     const result = toolError(new Error("Something unexpected happened"));
-    expect(result.content[0].text).toBe("Error: Something unexpected happened");
-    expect(result.content[0].text).not.toContain("Suggestions");
+    expect(result.content[0].text).toContain("Error [UNKNOWN]: Something unexpected happened");
+    expect(result.content[0].text).not.toContain("**Suggestion:**");
   });
 });
 
@@ -1115,8 +1118,9 @@ describe("toolError diagnoseError enhancements", () => {
   it("suggests retry for ETIMEDOUT", () => {
     const result = toolError(new Error("connect ETIMEDOUT 10.0.0.1:4096"));
     const text = result.content[0].text;
-    expect(text).toContain("not responding");
-    expect(text).toContain("retry");
+    expect(text).toContain("Error [TIMEOUT]");
+    expect(text).toContain("opencode_run");
+    expect(text).toContain("**Suggestion:**");
   });
 
   it("suggests opencode_run for timeout errors", () => {
@@ -1129,12 +1133,76 @@ describe("toolError diagnoseError enhancements", () => {
     const result = toolError(new Error("Invalid directory: \"./foo\" is not an absolute path"));
     const text = result.content[0].text;
     expect(text).toContain("absolute path");
-    expect(text).toContain("/home/user/my-project");
+    expect(text).toContain("INVALID_DIRECTORY");
   });
 
   it("suggests absolute path for directory not found errors", () => {
     const result = toolError(new Error("Directory not found: \"/bad/path\" does not exist"));
     const text = result.content[0].text;
     expect(text).toContain("absolute path");
+    expect(text).toContain("INVALID_DIRECTORY");
+  });
+});
+
+// ─── MEK-282 structured error surfacing ──────────────────────────────────
+
+describe("MEK-282 structured error surfacing", () => {
+  it("includes raw body and headers in structured block for a 429 OpenCodeError", () => {
+    const err = new OpenCodeError(
+      "Rate limit exceeded",
+      429,
+      "POST",
+      "/session/abc/message",
+      JSON.stringify({ error: "rate limit", retry_after: 60 }),
+    );
+    const result = toolError(err, {
+      providerID: "openrouter",
+      modelID: "anthropic/claude-sonnet-4.5",
+      sessionId: "abc",
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text;
+    expect(text).toContain("<!-- structured-error");
+    const match = text.match(/<!-- structured-error\n([\s\S]*?)\n-->/);
+    expect(match).not.toBeNull();
+    const structured = JSON.parse(match![1]);
+    expect(structured.code).toBe("RATE_LIMITED");
+    expect(structured.raw.httpStatus).toBe(429);
+    expect(structured.raw.method).toBe("POST");
+    expect(structured.raw.path).toBe("/session/abc/message");
+    expect(structured.raw.bodyJson.retry_after).toBe(60);
+    expect(structured.provider).toBe("openrouter");
+    expect(structured.modelIdRequested).toBe("anthropic/claude-sonnet-4.5");
+    expect(structured.sessionId).toBe("abc");
+    expect(structured.suggestedAction).toBeDefined();
+  });
+
+  it("extracts tokenUsage from step-finish parts and surfaces it in structured error", () => {
+    const response = {
+      parts: [
+        { type: "step-finish", tokens: { input: 128, output: 0, reasoning: 14 } },
+        { type: "text", text: "" },
+      ],
+    };
+    const analysis = analyzeMessageResponse(response);
+    expect(analysis.isEmpty).toBe(true);
+    expect(analysis.tokenUsage).toEqual({ prompt: 128, completion: 0, reasoning: 14 });
+
+    const err = new Error("The AI returned a response with no text content...");
+    const result = toolError(err, {
+      providerID: "opencode",
+      modelID: "deepseek-v4-flash-free",
+      sessionId: "xyz",
+      responseParts: response.parts,
+    });
+    const match = result.content[0].text.match(/<!-- structured-error\n([\s\S]*?)\n-->/);
+    expect(match).not.toBeNull();
+    const structured = JSON.parse(match![1]);
+    expect(structured.code).toBe("EMPTY_RESPONSE");
+    expect(structured.provider).toBe("opencode");
+    expect(structured.modelIdRequested).toBe("deepseek-v4-flash-free");
+    expect(structured.sessionId).toBe("xyz");
+    expect(structured.tokenUsage.completion).toBe(0);
+    expect(structured.tokenUsage.reasoning).toBe(14);
   });
 });
