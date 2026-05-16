@@ -35,12 +35,11 @@ the wire protocol or tool surface — drop-in replacement for `opencode-mcp@1.10
 - `[fork]` `repository`/`homepage`/`bugs` URLs now point at `MekaretEriker/opencode-mcp`.
 - `[fork]` `postbuild` script guards `chmod +x` with `|| true` so it doesn't fail on Windows runners (no chmod).
 - `[fork]` LICENSE: dual copyright line preserving Alaeddine Messadi's original attribution alongside the fork maintainer's.
+- `[fork]` Tests `tests/helpers.test.ts`, `tests/client.test.ts`, `tests/tools.test.ts` — hardcoded `/tmp` replaced by `os.tmpdir()` so the suite is platform-agnostic and Windows CI runner can pass. Addresses the "13 Linux-only failures" called out in upstream commit `e8e6cfe`. See `SPEC-fork.md` §4 patch #5.
 
 ### Patches pending upstream
 
-None — this release contains zero divergence from upstream `main` HEAD. The three
-upstream commits we ship are unreleased on npm but already merged on master. The fork
-exists to fix the npm release lag, not to diverge.
+- The `os.tmpdir()` test fix above is fork-only for now. Will submit to upstream as a PR; if merged it drops from the fork on the next rebase.
 
 ## [1.10.1] - 2026-04-10
 

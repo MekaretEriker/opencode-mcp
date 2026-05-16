@@ -1,4 +1,7 @@
 import { describe, it, expect, beforeEach, afterEach, vi } from "vitest";
+import { tmpdir } from "node:os";
+
+const TMP = tmpdir();
 import {
   formatMessageResponse,
   formatMessageList,
@@ -897,24 +900,24 @@ describe("normalizeDirectory", () => {
   });
 
   it("normalizes a valid absolute path", () => {
-    const result = normalizeDirectory("/tmp");
-    expect(result).toBe("/tmp");
+    const result = normalizeDirectory(TMP);
+    expect(result).toBe(TMP);
   });
 
   it("removes trailing slashes", () => {
-    const result = normalizeDirectory("/tmp/");
-    expect(result).toBe("/tmp");
+    const result = normalizeDirectory(TMP + "/");
+    expect(result).toBe(TMP);
   });
 
   it("resolves .. in paths", () => {
-    const result = normalizeDirectory("/tmp/foo/..");
-    expect(result).toBe("/tmp");
+    const result = normalizeDirectory(TMP + "/foo/..");
+    expect(result).toBe(TMP);
   });
 
   it("resolves . in paths", () => {
     // /tmp/. resolves to /tmp, which exists
-    const result = normalizeDirectory("/tmp/.");
-    expect(result).toBe("/tmp");
+    const result = normalizeDirectory(TMP + "/.");
+    expect(result).toBe(TMP);
   });
 
   it("throws for non-existent directory", () => {
@@ -924,8 +927,8 @@ describe("normalizeDirectory", () => {
 
   it("accepts a known existing directory", () => {
     // /tmp always exists on Linux
-    const result = normalizeDirectory("/tmp");
-    expect(result).toBe("/tmp");
+    const result = normalizeDirectory(TMP);
+    expect(result).toBe(TMP);
   });
 
   it("accepts the process working directory on any platform", () => {

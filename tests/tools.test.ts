@@ -1,4 +1,7 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
+import { tmpdir } from "node:os";
+
+const TMP_DIR = tmpdir();
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../src/client.js";
 import { registerGlobalTools } from "../src/tools/global.js";
@@ -2247,8 +2250,8 @@ describe("Tool handlers", () => {
     it("opencode_status works with valid directory (no false positives)", async () => {
       const { tools } = setupTools();
       const handler = tools.get("opencode_status")!;
-      // /tmp always exists
-      const result = await handler({ directory: "/tmp" });
+      // Use os.tmpdir() to avoid Linux-only assumptions
+      const result = await handler({ directory: TMP_DIR });
       expect(result.isError).toBeUndefined();
     });
 
