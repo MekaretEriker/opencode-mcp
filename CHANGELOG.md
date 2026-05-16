@@ -9,6 +9,27 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [Unreleased] — target `1.11.0-mekareteriker.0`
+
+Batched release covering MEK-282, MEK-283, MEK-284. Will bump to `1.11.0-mekareteriker.0`
+(minor — adds the new `opencode_run_streaming` tool from MEK-283).
+
+### Added
+
+- `[fork]` **MEK-284 — Idempotency layer for POST/PUT/PATCH.** In-flight or recently-resolved
+  non-idempotent requests with identical `(method, path, body)` are deduplicated transparently
+  via an in-memory `Map<key, Promise>` (key = `sha256(method:path:body)`, TTL 60s). Eliminates
+  the entire class of "duplicate prompt in queue" bugs even if MEK-281 is bypassed, regressed,
+  or if another MCP client retries on its own.
+  - Configurable via env `OPENCODE_MCP_IDEMPOTENCY_WINDOW_MS` (0 disables).
+  - Lazy GC on each insert keeps the map size bounded.
+  - Cache the in-flight `Promise<Response>` (not the resolved value) so parallel callers
+    all await the same response.
+  - `autoServe` reconnection bypasses + invalidates the cache entry for the failed key,
+    so retries after server restart get a fresh attempt instead of the cached failure.
+  - Exports `_resetIdempotencyMap()` for test isolation.
+  - 4 regression tests added in `tests/client.test.ts`.
+
 ## [1.10.2-mekareteriker.1] - 2026-05-16
 
 ### Fixed

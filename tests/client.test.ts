@@ -2,7 +2,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import { tmpdir } from "node:os";
 
 const TMP = tmpdir();
-import { OpenCodeClient, OpenCodeError } from "../src/client.js";
+import { OpenCodeClient, OpenCodeError, _resetIdempotencyMap } from "../src/client.js";
 
 // ─── OpenCodeError ───────────────────────────────────────────────────────
 
@@ -241,6 +241,10 @@ describe("OpenCodeClient", () => {
   });
 
   describe("error handling", () => {
+    beforeEach(() => {
+      _resetIdempotencyMap();
+    });
+
     it("throws OpenCodeError for non-ok responses", async () => {
       fetchMock.mockResolvedValue({
         ok: false,
@@ -364,6 +368,86 @@ describe("OpenCodeClient", () => {
         client.delete("/session/ses_test/message")
       ).rejects.toThrow(/fetch failed/);
       expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+  });
+
+  // MEK-284 — Idempotency: in-flight or recently-resolved POST/PUT/PATCH
+  // requests with identical (method, path, body) return the same Promise
+  // instead of triggering a fresh HTTP call. Default TTL 60s, env-disable
+  // via OPENCODE_MCP_IDEMPOTENCY_WINDOW_MS=0.
+
+  describe("idempotency (MEK-284)", () => {
+    beforeEach(() => {
+      _resetIdempotencyMap();
+    });
+
+    it("dedupes 3 parallel identical POST calls into 1 HTTP request", async () => {
+      // Slow mock response so all 3 calls happen in flight before resolution
+      let resolveResponse: (v: { ok: boolean; status: number; headers: Map<string, string>; json: () => Promise<unknown>; text: () => Promise<string> }) => void;
+      const responsePromise = new Promise<{ ok: boolean; status: number; headers: Map<string, string>; json: () => Promise<unknown>; text: () => Promise<string> }>((res) => {
+        resolveResponse = res;
+      });
+      fetchMock.mockReturnValue(responsePromise);
+
+      const client = createClient();
+      const body = { parts: [{ type: "text", text: "hi" }] };
+
+      // Fire 3 identical calls in parallel
+      const p1 = client.post("/session/ses_test/message", body);
+      const p2 = client.post("/session/ses_test/message", body);
+      const p3 = client.post("/session/ses_test/message", body);
+
+      // Resolve the in-flight fetch
+      resolveResponse!({
+        ok: true,
+        status: 200,
+        headers: new Map([["content-type", "application/json"]]),
+        json: () => Promise.resolve({ ok: true }),
+        text: () => Promise.resolve(""),
+      });
+
+      const [r1, r2, r3] = await Promise.all([p1, p2, p3]);
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+      expect(r1).toEqual({ ok: true });
+      expect(r2).toEqual({ ok: true });
+      expect(r3).toEqual({ ok: true });
+    });
+
+    it("dedupes sequential identical POST calls within TTL window", async () => {
+      fetchMock.mockResolvedValue(mockResponse({ ok: true }));
+
+      const client = createClient();
+      const body = { parts: [{ type: "text", text: "hi" }] };
+
+      await client.post("/session/ses_test/message", body);
+      await client.post("/session/ses_test/message", body);
+      await client.post("/session/ses_test/message", body);
+
+      // Only the first call hits the network; 2nd and 3rd return the cached Promise
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+
+    it("does NOT dedupe POSTs with different bodies", async () => {
+      fetchMock.mockResolvedValue(mockResponse({ ok: true }));
+
+      const client = createClient();
+
+      await client.post("/session/ses_test/message", { parts: [{ type: "text", text: "first" }] });
+      await client.post("/session/ses_test/message", { parts: [{ type: "text", text: "second" }] });
+
+      // Different bodies → different idempotency keys → 2 distinct fetches
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+    });
+
+    it("does NOT dedupe GET requests (only POST/PUT/PATCH)", async () => {
+      fetchMock.mockResolvedValue(mockResponse({ ok: true }));
+
+      const client = createClient();
+      await client.get("/health");
+      await client.get("/health");
+
+      // GET is not subject to idempotency cache — each call hits the network
+      expect(fetchMock).toHaveBeenCalledTimes(2);
     });
   });
 

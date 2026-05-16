@@ -4,6 +4,8 @@
  * Features:
  *  - Basic auth support
  *  - Automatic retry with exponential backoff for transient errors
+ *  - Method/path-aware retry (MEK-281): POST/PUT/PATCH never retried
+ *  - Idempotency keys (MEK-284): in-flight POST/PUT/PATCH dedup via Map
  *  - Proper 204 No Content handling on all methods
  *  - SSE streaming support
  *  - Error categorization (transient vs permanent)
@@ -11,6 +13,7 @@
  *  - Lazy server reconnection on connection failure
  */
 
+import { createHash } from "node:crypto";
 import { normalizeDirectory } from "./helpers.js";
 import { ensureServer, isServerRunning } from "./server-manager.js";
 
@@ -95,6 +98,63 @@ function isSafeToRetry(method: string, path: string): boolean {
   return true;
 }
 
+// ─── MEK-284: Idempotency layer ───────────────────────────────────────
+//
+// Dedup transparent des POST/PUT/PATCH identiques en flight ou récemment
+// résolus. Empêche les doublons côté serveur quand un caller (le wrapper
+// lui-même, le client MCP, l'utilisateur, un MCP client buggué) re-soumet
+// la même requête dans la fenêtre TTL.
+//
+// Complément à MEK-281 :
+//  - MEK-281 fast-fails les retries sur POST/PUT/PATCH côté wrapper
+//  - MEK-284 dédup silencieusement quoi qu'il arrive en amont
+//
+// Configurable via env `OPENCODE_MCP_IDEMPOTENCY_WINDOW_MS` (= 0 disables).
+
+type IdempotencyEntry = {
+  promise: Promise<unknown>;
+  expiresAt: number;
+};
+
+/** Map en mémoire des promises en flight + récemment résolues. */
+const idempotencyMap = new Map<string, IdempotencyEntry>();
+
+/** Fenêtre TTL pour le cache de dedup. Default 60s, override via env. */
+const IDEMPOTENCY_WINDOW_MS = (() => {
+  const raw = process.env.OPENCODE_MCP_IDEMPOTENCY_WINDOW_MS;
+  if (raw === undefined) return 60_000;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 60_000;
+})();
+
+/** Méthodes HTTP soumises au dedup idempotency. */
+const IDEMPOTENT_METHODS = new Set(["POST", "PUT", "PATCH"]);
+
+/** sha256 helper sur node:crypto. */
+function sha256(input: string): string {
+  return createHash("sha256").update(input).digest("hex");
+}
+
+/**
+ * Build a stable idempotency key for a (method, path, body) triple.
+ * Body is JSON-stringified so different model/agent/variant params produce
+ * distinct keys even with the same prompt text.
+ */
+function buildIdempotencyKey(method: string, path: string, body: unknown): string {
+  const bodyHash = body !== undefined ? sha256(JSON.stringify(body)) : "";
+  return `${method}:${path}:${bodyHash}`;
+}
+
+/**
+ * Test-only helper: reset the in-memory map. Used by vitest to isolate tests.
+ * Not part of the public API.
+ *
+ * @internal
+ */
+export function _resetIdempotencyMap(): void {
+  idempotencyMap.clear();
+}
+
 /** Check if an error looks like a connection failure (server unreachable). */
 function isConnectionError(err: Error): boolean {
   const msg = err.message.toLowerCase();
@@ -161,7 +221,45 @@ export class OpenCodeClient {
     return h;
   }
 
+  /**
+   * Public entry point — wraps doRequest with MEK-284 idempotency dedup
+   * for POST/PUT/PATCH. GET/HEAD/OPTIONS/DELETE skip the cache entirely.
+   */
   private async request<T = unknown>(
+    method: string,
+    path: string,
+    opts?: {
+      query?: Record<string, string>;
+      body?: unknown;
+      timeout?: number;
+      directory?: string;
+    },
+  ): Promise<T> {
+    // MEK-284: dedup non-idempotent in-flight or recently-resolved requests.
+    if (IDEMPOTENCY_WINDOW_MS > 0 && IDEMPOTENT_METHODS.has(method.toUpperCase())) {
+      const key = buildIdempotencyKey(method, path, opts?.body);
+
+      // Lazy GC: drop expired entries on each insert attempt.
+      const now = Date.now();
+      for (const [k, entry] of idempotencyMap) {
+        if (entry.expiresAt <= now) idempotencyMap.delete(k);
+      }
+
+      const existing = idempotencyMap.get(key);
+      if (existing) {
+        return existing.promise as Promise<T>;
+      }
+
+      const promise = this.doRequest<T>(method, path, opts);
+      idempotencyMap.set(key, { promise, expiresAt: now + IDEMPOTENCY_WINDOW_MS });
+      return promise;
+    }
+
+    return this.doRequest<T>(method, path, opts);
+  }
+
+  /** Actual HTTP request impl (formerly the body of request()). */
+  private async doRequest<T = unknown>(
     method: string,
     path: string,
     opts?: {
@@ -256,8 +354,15 @@ export class OpenCodeClient {
             password: this.password
           });
         }
-        // Retry the original request once after reconnection
-        return this.request<T>(method, path, opts);
+        // Retry the original request once after reconnection.
+        // MEK-284: bypass the idempotency cache (which still holds the
+        // failed Promise from the first attempt) and invalidate that entry
+        // so future identical requests get a fresh attempt instead of the
+        // cached failure.
+        if (IDEMPOTENT_METHODS.has(method.toUpperCase())) {
+          idempotencyMap.delete(buildIdempotencyKey(method, path, opts?.body));
+        }
+        return this.doRequest<T>(method, path, opts);
       } catch (reconnectErr) {
         console.error(
           `Server reconnection failed: ${reconnectErr instanceof Error ? reconnectErr.message : String(reconnectErr)}`,
