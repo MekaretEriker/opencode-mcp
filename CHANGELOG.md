@@ -1,0 +1,208 @@
+# Changelog
+
+All notable changes to this project will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward from
+[AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
+Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
+
+## [1.10.2-mekareteriker.0] - 2026-05-16
+
+First release of the `@mekareteriker/opencode-mcp` fork. Re-publishes upstream `main` HEAD
+(three commits sitting unreleased on master since `v1.10.1`, including the critical
+Windows path fix), adds CI matrix for Linux/Windows/macOS, and changes nothing about
+the wire protocol or tool surface — drop-in replacement for `opencode-mcp@1.10.1`.
+
+### Fixed
+
+- `[upstream]` Accept Windows absolute paths in `normalizeDirectory` ([upstream commit `e8e6cfe`](https://github.com/AlaeddineMessadi/opencode-mcp/commit/e8e6cfe), [PR #6](https://github.com/AlaeddineMessadi/opencode-mcp/pull/6) by [@samuelgudi](https://github.com/samuelgudi)). Previously the validator required the resolved path to start with `"/"`, which broke every tool that accepts `directory` on Windows clients. Now uses platform-aware `path.isAbsolute`.
+
+### Added
+
+- `[upstream]` `OPENCODE_SERVE_ARGS` env var for passing custom args to `opencode serve` ([upstream commit `0f1e1f6`](https://github.com/AlaeddineMessadi/opencode-mcp/commit/0f1e1f6), PR #7/#9).
+- `[upstream]` `variant` parameter for model selection in tools ([upstream commit `4756a36`](https://github.com/AlaeddineMessadi/opencode-mcp/commit/4756a36), PR #8/#10).
+- `[fork]` GitHub Actions CI: matrix `os: [ubuntu-latest, windows-latest, macos-latest]` × `node: [18, 20, 22]`, plus an npm-pack smoke job.
+- `[fork]` `release.yml` workflow: publishes to npm on `v*` tag push with provenance.
+- `[fork]` `sync-upstream.yml` workflow: daily cron mirrors upstream `main` into `upstream-tracking` branch and opens an issue if new commits land.
+- `[fork]` `publishConfig.access: "public"` so the scoped package publishes without an extra `--access` flag.
+
+### Changed
+
+- `[fork]` Package name: `opencode-mcp` → `@mekareteriker/opencode-mcp`.
+- `[fork]` `repository`/`homepage`/`bugs` URLs now point at `MekaretEriker/opencode-mcp`.
+- `[fork]` `postbuild` script guards `chmod +x` with `|| true` so it doesn't fail on Windows runners (no chmod).
+- `[fork]` LICENSE: dual copyright line preserving Alaeddine Messadi's original attribution alongside the fork maintainer's.
+
+### Patches pending upstream
+
+None — this release contains zero divergence from upstream `main` HEAD. The three
+upstream commits we ship are unreleased on npm but already merged on master. The fork
+exists to fix the npm release lag, not to diverge.
+
+## [1.10.1] - 2026-04-10
+
+### Changed
+
+- Instruction examples now use discovered/default provider and model values instead of hardcoded Anthropic examples. This avoids steering MCP clients toward unavailable providers and aligns the startup guidance with `opencode_setup`.
+
+### Fixed
+
+- Health checks for authenticated OpenCode servers now propagate HTTP basic auth through the full auto-start path, including startup polling and reconnection flows.
+- `ensureServer()` now forwards configured server credentials during startup so remote protected servers no longer fail the health probe while coming online.
+
+### Stats
+
+- Tool count: 79
+- Tests: 320
+
+## [1.10.0] - 2026-02-10
+
+### Added
+
+- **`opencode_permission_list` tool** — lists all pending permission requests across sessions, showing permission type, session ID, patterns, and tool name. Helps detect and unblock sessions stuck waiting for approval in headless mode.
+- **`OPENCODE_DEFAULT_PROVIDER` / `OPENCODE_DEFAULT_MODEL` env vars** — set default provider and model for all tool calls. Three-tier resolution: explicit params → env defaults → server fallback. Implemented via `applyModelDefaults()` across all 8 model-accepting tools.
+- **`normalizeDirectory()` path validation** — resolves paths to absolute, strips trailing slashes, resolves `..`, and rejects non-existent directories with descriptive errors.
+- **Lazy server reconnection** — on `ECONNREFUSED`/`ENOTFOUND` after all retries, auto-restarts the OpenCode server (max 3 reconnection attempts per MCP session).
+- **Enhanced `diagnoseError()`** — 6 new error patterns with contextual suggestions (empty response, model errors, permission issues, config problems).
+- **Directory display in workflow responses** — `opencode_run`, `opencode_fire`, `opencode_check`, `opencode_status` now show the active project directory.
+- **Session-directory consistency warnings** — warns when a session was created for a different directory than the current request.
+- **Permissions guidance in instructions** — recommends `"permission": "allow"` in `opencode.json` for headless use, documents permission tools.
+
+### Changed
+
+- **`opencode_session_permission` updated** — now uses the new API (`POST /permission/{requestID}/reply`) with automatic fallback to the deprecated endpoint. `reply` parameter changed from free string to enum: `"once"` | `"always"` | `"reject"`. Removed the old `remember` parameter.
+
+### Fixed
+
+- **Directory validation errors swallowed by `.catch(() => null)`** — `opencode_status`, `opencode_context`, and `opencode_check` used `Promise.all` with `.catch(() => null)` which silently ate validation errors (showing "UNREACHABLE" instead of "directory not found"). Fixed by adding early `normalizeDirectory()` before `Promise.all` in all 3 tools.
+
+### Removed
+
+- Demo projects (`projects/snake-game/`, `projects/nextjs-todo-app/`) — these were test artifacts.
+
+### Stats
+
+- Tool count: 79 (up from 78)
+- Tests: 316 (up from 275)
+
+## [1.9.0] - 2026-02-10
+
+### Added
+
+- **`opencode_run` workflow tool** — one-call solution for complex tasks: creates a session, sends the prompt, polls until completion, and returns the result with todo progress. Supports `maxDurationSeconds` (default 10 min) and session reuse via `sessionId`.
+- **`opencode_fire` workflow tool** — fire-and-forget: creates a session, dispatches the task, and returns immediately with the session ID and monitoring instructions. Best for long-running tasks where you want to do other work in parallel.
+- **`opencode_check` workflow tool** — compact progress report for a session: status, todo progress (completed/total), current task, file change count. Much cheaper than `opencode_conversation`. Supports `detailed` mode for last message text.
+- Tool count: 78 (up from 75)
+- Tests: 275 (up from 267) — 8 new tests covering `opencode_run` (polling, error, session reuse), `opencode_fire` (dispatch, session reuse), and `opencode_check` (progress, completion, detailed mode)
+
+### Changed
+
+- Instructions updated with new Tier 2 tools (`opencode_run`, `opencode_fire`, `opencode_check`) and simplified recommended workflows
+- Best-practices prompt updated with new tool selection table
+
+## [1.8.0] - 2026-02-10
+
+### Added
+
+- **`instructions` field** — the MCP server now provides a comprehensive structured guide via the `instructions` option in the `McpServer` constructor. This helps LLM clients understand tool tiers (5 levels from essential to dangerous), recommended workflows, and the async `message_send_async` + `wait` pattern for long tasks.
+- **Tool annotations** — all tools now carry MCP `readOnlyHint` / `destructiveHint` annotations so clients can auto-approve safe read-only operations and warn before destructive ones (e.g. `session_delete`, `instance_dispose`)
+- **`opencode-best-practices` prompt** — new prompt template (6th prompt) covering setup, provider/model selection, tool selection table, prompt writing tips, monitoring, error recovery, and common pitfalls
+- **Honest wake-up documentation** — `opencode_wait` description now explains that most MCP clients do NOT interrupt the LLM for log notifications, and suggests `opencode_session_todo` for monitoring very long tasks
+
+### Changed
+
+- `opencode_instance_dispose` description now includes a WARNING about permanent shutdown
+- Prompts: 6 (up from 5)
+- Tests: 267 (up from 266)
+
+## [1.6.0] - 2026-02-09
+
+### Fixed
+
+- **Empty message display** — `formatMessageList()` no longer shows blank output for assistant messages that performed tool calls but had no text content. It now shows concise tool action summaries like `Agent performed 3 action(s): Write: /src/App.tsx, Bash: npm install`
+- **Session status `[object Object]`** — `opencode_sessions_overview` and `opencode_session_status` now correctly resolve status objects (e.g. `{ state: "running" }`) to readable strings instead of displaying `[object Object]`
+- **`opencode_wait` timeout message** — now includes actionable recovery suggestions (`opencode_conversation` to check progress, `opencode_session_abort` to stop) and correctly resolves object-shaped status values during polling
+- **`toolError()` contextual suggestions** — common error patterns (401/403 auth, timeout, rate limit, connection refused, session not found) now include helpful follow-up tool suggestions instead of bare error text
+
+### Added
+
+- `resolveSessionStatus()` exported helper in `src/helpers.ts` — normalizes status from string, object (`{ state, status, type }`), or boolean flags into a readable string
+- `summarizeToolInput()` helper — extracts the most useful arg (path, command, query, url) from tool input objects for compact display
+- `extractCostMeta()` helper — extracts cost/token metadata from `step-finish` message parts
+- `diagnoseError()` private helper — pattern-matches common errors and returns contextual suggestions
+- 11 new tool handler tests for `opencode_sessions_overview`, `opencode_session_status`, and `opencode_wait` covering object status resolution, timeout messages, and edge cases
+- Tests: 266 total (up from 255)
+
+## [1.5.0] - 2026-02-09
+
+### Added
+
+- `opencode_status` workflow tool for a fast health/providers/sessions/VCS dashboard
+- `opencode_provider_test` workflow tool to quickly validate a provider/model actually responds (creates a temp session, sends a tiny prompt, cleans up)
+- `opencode_session_search` to find sessions by keyword in title (also matches session ID)
+- `scripts/mcp-smoke-test.mjs` end-to-end smoke test runner (spawns opencode-mcp over stdio and exercises most tools/workflows against a running OpenCode server)
+
+### Changed
+
+- Provider configuration detection is now shared via `isProviderConfigured()` (used consistently across provider listing and setup workflows)
+- Multiple tool outputs are more token-efficient and user-friendly (compact provider list/model listing, session formatting, and warning surfacing)
+- Tool count: 75 (up from 72)
+- Tests: 255 total
+
+### Fixed
+
+- `opencode_message_send` no longer silently returns empty output for empty responses; it now appends actionable warnings like `opencode_ask`/`opencode_reply`
+- `opencode_session_share` / `opencode_session_unshare` now return formatted confirmations instead of raw JSON dumps
+- `opencode_events_poll` no longer crashes on timeout when the SSE stream is idle (abort now cancels the stream safely)
+
+## [1.4.0] - 2025-02-09
+
+### Added
+
+- **Auth error detection** — `opencode_ask` and `opencode_reply` now analyze AI responses for signs of failure (empty response, missing text content, error keywords like "unauthorized" or "invalid key") and append a clear `--- WARNING ---` with actionable guidance instead of silently returning nothing
+- **`analyzeMessageResponse()` helper** — new diagnostic function in `src/helpers.ts` that detects empty, error, and auth-related response issues
+- **Provider probing in `opencode_setup`** — connected providers are now verified with a lightweight "Reply with OK" probe to distinguish between WORKING, CONNECTED BUT NOT RESPONDING (bad API key), and could-not-verify states. Unconfigured providers now show available auth methods.
+- **`opencode_provider_models` tool** — new tool to list models for a single provider, replacing the previous approach of dumping all providers and all models in one massive response
+- **164 tests** (up from 140) — new tests for `analyzeMessageResponse`, auth warning in ask/reply, provider probe statuses, compact provider list, and per-provider model listing
+
+### Changed
+
+- **`opencode_provider_list` is now compact** — returns only provider names, connection status, and model count (not the full model list). This dramatically reduces token usage for MCP clients. Use `opencode_provider_models` with a provider ID to drill into a specific provider's models.
+- Tool count: 72 (up from 71)
+
+## [1.3.0] - 2025-02-08
+
+### Added
+
+- **Auto-serve** — the MCP server now automatically detects whether `opencode serve` is running and starts it as a child process if not. No more manual "start opencode serve" step before using the MCP server.
+  - Checks the `/global/health` endpoint on startup
+  - Finds the `opencode` binary via `which`/`where`
+  - Spawns `opencode serve --port <port>` and polls until healthy
+  - Graceful shutdown: kills the managed child process on SIGINT/SIGTERM/exit
+  - Clear error messages with install instructions if the binary is not found
+- **`OPENCODE_AUTO_SERVE` env var** — set to `"false"` to disable auto-start for users who prefer manual control
+- **`src/server-manager.ts` module** — new module with `findBinary()`, `isServerRunning()`, `startServer()`, `stopServer()`, `ensureServer()`
+- **140 tests** (up from 117) — 23 new tests for the server manager covering health checks, binary detection, auto-start, error cases, and shutdown
+
+### Changed
+
+- Startup flow in `src/index.ts` now calls `ensureServer()` before connecting the MCP transport
+- Updated README: removed manual "start opencode serve" step, added auto-serve documentation, updated env vars table and architecture section
+
+## [1.2.0] - 2025-02-08
+
+### Added
+
+- **Per-tool project directory targeting** — every tool now accepts an optional `directory` parameter that scopes the request to a specific project directory via the `x-opencode-directory` header. This enables working with multiple projects simultaneously from a single MCP connection without restarting the server.
+- **`opencode_setup` workflow tool** — new high-level onboarding tool that checks server health, lists provider configuration status, and shows project info. Use it as the first step when starting work.
+- **117 tests** (up from 102) — new tests for directory header propagation, `opencode_setup` handler, and `directoryParam` validation
+
+### Changed
+
+- `opencode_find_file` tool: renamed the search-root override parameter from `directory` to `searchDirectory` to avoid collision with the new project-scoping `directory` parameter
+- Auth tools (`opencode_auth_set`, `opencode_provider_oauth_authorize`, `opencode_provider_oauth_callback`) do not accept `directory` — auth credentials are global, not project-scoped
+
+## [
