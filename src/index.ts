@@ -199,7 +199,7 @@ registerProjectTools(server, client, sdkFactory);
 registerSessionTools(server, client, sdkFactory);
 registerMessageTools(server, client, sdkFactory);
 registerFileTools(server, client, sdkFactory);
-registerProviderTools(server, client);
+registerProviderTools(server, client, sdkFactory);
 registerMiscTools(server, client);
 
 // ── High-level workflow tools ───────────────────────────────────────

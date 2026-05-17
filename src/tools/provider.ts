@@ -1,11 +1,34 @@
+/**
+ * Provider tools — list providers/models, manage auth, run OAuth flows.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  When `sdkFactory` is
+ * undefined (tests, legacy consumers), the handler falls back to the
+ * legacy `OpenCodeClient.get/post/put` methods, which propagate `directory`
+ * per-request via the `{directory}` option.
+ *
+ * SDK mappings (5 of 6 handlers mapped, 1 gap):
+ * - `sdk.provider.list()`                       → GET  /provider
+ * - `sdk.provider.auth()`                       → GET  /provider/auth
+ * - `sdk.provider.oauth.authorize({path:{id}})` → POST /provider/{id}/oauth/authorize
+ * - `sdk.auth.set({path:{id}, body})`           → PUT  /auth/{providerID}
+ * - `opencode_provider_oauth_callback` kept raw: SDK exposes
+ *   `body:{method,code?}` but legacy passes arbitrary Record<string,unknown>.
+ */
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import { toolJson, toolError, toolResult, directoryParam, isProviderConfigured } from "../helpers.js";
 
 export function registerProviderTools(
   server: McpServer,
   client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
 ) {
   server.tool(
     "opencode_provider_list",
@@ -14,8 +37,11 @@ export function registerProviderTools(
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/provider", undefined, directory);
+        const raw = sdk
+          ? (await sdk.provider.list()).data
+          : await client.get("/provider", undefined, directory);
         const providers = (
           raw && typeof raw === "object" && "all" in (raw as Record<string, unknown>)
             ? (raw as Record<string, unknown>).all
@@ -87,8 +113,11 @@ export function registerProviderTools(
       directory: directoryParam,
     },
     async ({ providerId, limit, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/provider", undefined, directory);
+        const raw = sdk
+          ? (await sdk.provider.list()).data
+          : await client.get("/provider", undefined, directory);
         const providers = (
           raw && typeof raw === "object" && "all" in (raw as Record<string, unknown>)
             ? (raw as Record<string, unknown>).all
@@ -156,8 +185,11 @@ export function registerProviderTools(
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/provider/auth", undefined, directory);
+        const raw = sdk
+          ? (await sdk.provider.auth()).data
+          : await client.get("/provider/auth", undefined, directory);
         if (raw && typeof raw === "object" && !Array.isArray(raw)) {
           const entries = Object.entries(raw as Record<string, unknown>);
           if (entries.length === 0) {
@@ -191,9 +223,12 @@ export function registerProviderTools(
       providerId: z.string().describe("Provider ID to authorize"),
     },
     async ({ providerId }) => {
+      const sdk = sdkFactory?.();
       try {
         return toolJson(
-          await client.post(`/provider/${providerId}/oauth/authorize`),
+          sdk
+            ? (await sdk.provider.oauth.authorize({ path: { id: providerId } })).data
+            : await client.post(`/provider/${providerId}/oauth/authorize`),
         );
       } catch (e) {
         return toolError(e);
@@ -212,6 +247,8 @@ export function registerProviderTools(
     },
     async ({ providerId, callbackData }) => {
       try {
+        // SDK gap: sdk.provider.oauth.callback() only exposes code?:string;
+        // legacy passes arbitrary Record<string,unknown> as the POST body.
         await client.post(
           `/provider/${providerId}/oauth/callback`,
           callbackData,
@@ -232,8 +269,15 @@ export function registerProviderTools(
       key: z.string().describe("API key or credential value"),
     },
     async ({ providerId, type, key }) => {
+      const sdk = sdkFactory?.();
       try {
-        await client.put(`/auth/${providerId}`, { type, key });
+        if (sdk) {
+          // SDK narrows body to ApiAuth|OAuth|WellKnownAuth; common case
+          // (type:"api") matches ApiAuth, other types handled by the server.
+          await sdk.auth.set({ path: { id: providerId }, body: { type, key } as any });
+        } else {
+          await client.put(`/auth/${providerId}`, { type, key });
+        }
         return toolResult(`Auth credentials set for ${providerId}.`);
       } catch (e) {
         return toolError(e);
