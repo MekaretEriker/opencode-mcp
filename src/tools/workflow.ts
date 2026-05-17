@@ -807,20 +807,17 @@ export function registerWorkflowTools(
           sid = session.id as string;
         }
 
-        // 2. Send prompt via /message endpoint
-        // NOTE: MEK-294 — /session/{sid}/prompt is accepted by opencode 1.14.50
-        // but does NOT trigger LLM execution. /message is the canonical endpoint
-        // that actually starts the agent (same one used by opencode_run, etc.).
-        const body: Record<string, unknown> = {
-          parts: [{ type: "text", text: prompt }],
-        };
-        const model = applyModelDefaults(providerID, modelID, variant);
-        if (model) body.model = model;
-        if (agent) body.agent = agent;
-
-        await client.post(`/session/${sid}/message`, body, { directory });
-
-        // 3. Subscribe SSE
+        // 2. Open SSE subscription FIRST (canonical SDK pattern — see AGENTS.md
+        //    "Source of truth"). The SSE connection must be established before
+        //    the dispatch that triggers events, otherwise events fire while we
+        //    are not listening and a fresh subscription only sees events
+        //    emitted after subscribe time. This is what client.event.subscribe()
+        //    does in the official @opencode-ai/sdk.
+        //
+        //    Use the global /event stream and filter by sessionID client-side.
+        //    Per-session /session/{sid}/event is not in the SDK and has caused
+        //    first-event-loss bugs historically — see commit 53aa725 +
+        //    AGENTS.md "SSE / streaming pattern".
         const maxMs = (maxDurationSeconds ?? 600) * 1000;
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), maxMs);
@@ -836,6 +833,35 @@ export function registerWorkflowTools(
             }
           : () => {};
 
+        const stream = client.subscribeSSE("/event", { signal: controller.signal, directory });
+        const iter = stream[Symbol.asyncIterator]();
+        // Kick off the underlying fetch immediately so the SSE connection is
+        // in-flight before the POST below. We do NOT await — we want the POST
+        // to race in parallel so the server emits events while our reader is
+        // already listening. The promise resolves when the first event arrives.
+        const firstEventP = iter.next();
+
+        // 3. Send prompt via canonical async endpoint /prompt_async.
+        //    Returns 204 immediately, emits SSE events for progress + completion.
+        //    See AGENTS.md "Source of truth" (MEK-294 + MEK-295 post-mortem):
+        //    - /prompt           — does not exist on opencode 1.14.50, silently
+        //                          accepted, never triggers the LLM (MEK-294)
+        //    - /message          — synchronous, blocks the agent loop, returns
+        //                          AssistantMessage. Used by opencode_run,
+        //                          opencode_ask. Wrong for a streaming tool
+        //                          because we'd miss session.idle (MEK-295)
+        //    - /prompt_async     — fire-and-forget (204), emits SSE events.
+        //                          Canonical for streaming dispatch.
+        const body: Record<string, unknown> = {
+          parts: [{ type: "text", text: prompt }],
+        };
+        const model = applyModelDefaults(providerID, modelID, variant);
+        if (model) body.model = model;
+        if (agent) body.agent = agent;
+
+        await client.post(`/session/${sid}/prompt_async`, body, { directory });
+
+        // 4. Consume SSE until session.idle for our session.
         let eventCount = 0;
         const eventCounts: Record<string, number> = {};
         let sawIdle = false;
@@ -851,56 +877,28 @@ export function registerWorkflowTools(
           return false;
         };
 
-        try {
-          // Try per-session SSE first; fall back to global /event
-          let streamPath = `/session/${sid}/event`;
-          let iter: AsyncIterator<{ event: string; data: string }, void, undefined>;
-          let firstEvent: { evt: { event: string; data: string }; parsed: any } | null = null;
-          try {
-            const stream = client.subscribeSSE(streamPath, { signal: controller.signal, directory });
-            iter = stream[Symbol.asyncIterator]();
-            // Probe first event with 500ms timeout — keep iterator alive on success
-            const firstEventP = (async () => {
-              const result = await iter.next();
-              if (result.done) return { kind: "stream-ended" as const };
-              const evt = result.value;
-              const parsed = JSON.parse(evt.data);
-              return { kind: "event" as const, evt, parsed };
-            })();
-            const timeoutP = new Promise<{ kind: "timeout" }>((res) =>
-              setTimeout(() => res({ kind: "timeout" }), 500),
-            );
-            const probe = await Promise.race([firstEventP, timeoutP]);
-            if (probe.kind !== "event") {
-              controller.abort();
-              throw new Error("Per-session SSE not available");
-            }
-            firstEvent = { evt: probe.evt, parsed: probe.parsed };
-          } catch {
-            streamPath = "/event";
-            iter = client.subscribeSSE(streamPath, { signal: controller.signal, directory })[Symbol.asyncIterator]();
-          }
+        const consumeEvent = (evt: { event: string; data: string }): boolean => {
+          let parsed: any;
+          try { parsed = JSON.parse(evt.data); } catch { return false; }
+          // Filter by sessionID — global /event mixes all sessions. Events
+          // without a sessionID (e.g. server.connected) are skipped silently.
+          const evtSid = parsed.properties?.sessionID;
+          if (!evtSid || evtSid !== sid) return false;
+          return processEvent(parsed);
+        };
 
-          // Process firstEvent from probe if available, then continue on same iterator
-          if (firstEvent) {
-            if (processEvent(firstEvent.parsed)) {
-              sawIdle = true;
-            }
+        try {
+          // Drain the in-flight first event (kicked off before POST).
+          const first = await firstEventP;
+          if (!first.done && first.value) {
+            consumeEvent(first.value);
           }
 
           if (!sawIdle) {
             while (true) {
               const { done, value: evt } = await iter.next();
               if (done) break;
-
-              let parsed: any;
-              try { parsed = JSON.parse(evt.data); } catch { continue; }
-
-              // Filter by sessionID when on global /event
-              const evtSid = parsed.properties?.sessionID;
-              if (streamPath === "/event" && evtSid && evtSid !== sid) continue;
-
-              if (processEvent(parsed)) break;
+              if (consumeEvent(evt)) break;
             }
           }
         } catch {
@@ -909,7 +907,7 @@ export function registerWorkflowTools(
           clearTimeout(timeout);
         }
 
-        // 4. If timeout without idle, return SESSION_HANG
+        // 5. If timeout without idle, return SESSION_HANG
         if (!sawIdle) {
           return toolError(
             new Error(`Session ${sid} did not emit session.idle within ${maxDurationSeconds ?? 600}s`),
@@ -917,10 +915,10 @@ export function registerWorkflowTools(
           );
         }
 
-        // 5. Double-check status (issue #3815: idle not deterministic)
+        // 6. Double-check status (issue #3815: idle not deterministic)
         const finalSession = (await client.get(`/session/${sid}`, undefined, directory)) as Record<string, unknown>;
 
-        // 6. Fetch final messages summary
+        // 7. Fetch final messages summary
         const messages = (await client.get(`/session/${sid}/message`, undefined, directory)) as unknown[];
         const formatted = formatMessageList(messages);
         const eventSummary = Object.entries(eventCounts)

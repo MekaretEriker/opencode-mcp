@@ -2001,11 +2001,11 @@ describe("Tool handlers", () => {
   });
 
   describe("opencode_run_streaming", () => {
-    it("handles happy path: tool.start → tool.end → session.idle", async () => {
+    it("handles happy path: tool.start → tool.end → session.idle (via /prompt_async + global /event)", async () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_test" });
-          if (path.includes("/message")) return Promise.resolve({});
+          if (path.includes("/prompt_async")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {
@@ -2017,14 +2017,9 @@ describe("Tool handlers", () => {
           return Promise.resolve({});
         }),
         subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
-          // First call: POST /session/ses_test/message uses /session/ses_test/event
-          if (path.startsWith("/session/")) {
-            yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test", toolName: "read" } }) };
-            yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test", toolName: "read" } }) };
-            yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_test" } }) };
-            return;
-          }
-          // Second call (restart after probe — actually never reached because first stream succeeds)
+          // MEK-295: always /event (global), never per-session — see AGENTS.md
+          // "Source of truth". Test asserts the path is what we expect.
+          expect(path).toBe("/event");
           yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test", toolName: "read" } }) };
           yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test", toolName: "read" } }) };
           yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_test" } }) };
@@ -2048,33 +2043,27 @@ describe("Tool handlers", () => {
       expect(text).toContain("Feature built!");
     });
 
-    it("falls back to /event when /session/{id}/event returns HTML", async () => {
-      let eventCalls = 0;
+    it("subscribes to /event BEFORE posting to /prompt_async (MEK-295 ordering guard)", async () => {
+      // Regression guard: if a future refactor accidentally swaps the order,
+      // we re-introduce the SSE-misses-session.idle bug from MEK-295. The
+      // canonical SDK pattern is: subscribe first, then POST. See AGENTS.md.
+      const callOrder: string[] = [];
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
-          if (path === "/session") return Promise.resolve({ id: "ses_fallback" });
-          if (path.includes("/message")) return Promise.resolve({});
+          callOrder.push(`post:${path}`);
+          if (path === "/session") return Promise.resolve({ id: "ses_order" });
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {
-          if (path === "/session/ses_fallback") return Promise.resolve({ id: "ses_fallback", cost: 0 });
+          if (path === "/session/ses_order") return Promise.resolve({ id: "ses_order", cost: 0 });
           if (path.includes("/message")) return Promise.resolve([
-            { info: { role: "assistant", id: "m1" }, parts: [{ type: "text", text: "Done" }] },
+            { info: { role: "assistant", id: "m1" }, parts: [{ type: "text", text: "ok" }] },
           ]);
           return Promise.resolve({});
         }),
-        subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
-          eventCalls++;
-          if (path.startsWith("/session/") && eventCalls === 1) {
-            // First call: per-session SSE, simulate parsing error (HTML body)
-            // We can only simulate by yielding invalid JSON in data
-            yield { event: "message", data: "<html><body>SPA fallback</body></html>" };
-            return;
-          }
-          // /event fallback with filtering
-          // session.updated events come with properties.sessionID
-          yield { event: "session.updated", data: JSON.stringify({ type: "session.updated", properties: { sessionID: "ses_other" } }) };
-          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_fallback" } }) };
+        subscribeSSE: vi.fn().mockImplementation(async function* () {
+          callOrder.push("subscribeSSE");
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_order" } }) };
         }),
       });
       const tools = new Map<string, Function>();
@@ -2086,20 +2075,22 @@ describe("Tool handlers", () => {
       registerWorkflowTools(mockServer, mockClient);
 
       const handler = tools.get("opencode_run_streaming")!;
-      const result = await handler({ prompt: "Do something" });
+      const result = await handler({ prompt: "Hi" });
       expect(result.isError).toBeFalsy();
-      const text = result.content[0].text;
-      expect(text).toContain("ses_fallback");
-      // Should have fallen back to /event, only ses_fallback events counted
-      expect(text).toContain("Events received: 1");
-      expect(text).toContain("1x session.idle");
+
+      const sseIdx = callOrder.indexOf("subscribeSSE");
+      const promptAsyncIdx = callOrder.indexOf("post:/session/ses_order/prompt_async");
+      expect(sseIdx).toBeGreaterThanOrEqual(0);
+      expect(promptAsyncIdx).toBeGreaterThanOrEqual(0);
+      // SSE subscription must happen BEFORE /prompt_async POST
+      expect(sseIdx).toBeLessThan(promptAsyncIdx);
     });
 
     it("returns SESSION_HANG via toolError on timeout", async () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_hang" });
-          if (path.includes("/message")) return Promise.resolve({});
+          if (path.includes("/prompt_async")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockResolvedValue({}),
@@ -2137,7 +2128,7 @@ describe("Tool handlers", () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_test" });
-          if (path.includes("/message")) return Promise.resolve({});
+          if (path.includes("/prompt_async")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {
@@ -2147,13 +2138,9 @@ describe("Tool handlers", () => {
           ]);
           return Promise.resolve({});
         }),
-        subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
-          if (path.startsWith("/session/")) {
-            // Per-session probe: throw by yielding invalid HTML-like data
-            yield { event: "message", data: "SPA-FALLBACK" };
-            return;
-          }
-          // /event global — mix of sessions
+        subscribeSSE: vi.fn().mockImplementation(async function* () {
+          // Global /event — mix of sessions. Filter must reject ses_other,
+          // including the ses_other session.idle that comes before ses_test's.
           yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_other" } }) };
           yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test" } }) };
           yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test" } }) };
@@ -2176,7 +2163,7 @@ describe("Tool handlers", () => {
       const text = result.content[0].text;
       expect(text).toContain("ses_test");
       // Should only count ses_test events: 1 tool.start + 1 tool.end + 1 session.idle = 3
-      // The ses_other events are filtered out, so:
+      // The ses_other events are filtered out.
       expect(text).toContain("Events received: 3");
     });
   });
