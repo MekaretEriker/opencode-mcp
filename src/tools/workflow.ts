@@ -1,11 +1,29 @@
 /**
  * High-level workflow tools — composite operations that make it easy
  * for an LLM to accomplish common tasks in a single call.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  A global cache in
+ * `src/index.ts` ensures equivalent directories share a client instance.
+ *
+ * When `sdkFactory` is undefined (tests, legacy consumers), the handler
+ * falls back to the legacy `OpenCodeClient.post/get/delete/subscribeSSE`
+ * methods, which propagate `directory` per-request via the `{directory}`
+ * option.
+ *
+ * ## SDK gaps (v1 `@opencode-ai/sdk`)
+ * - `global.health()` is NOT present in v1 (only v2).  Fall back to
+ *   `client.get("/global/health")`.  Source: https://opencode.ai/docs/sdk.md
+ *   (v1 `Global` class only has `event()`).
  */
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import {
   formatMessageResponse,
   formatMessageList,
@@ -25,6 +43,7 @@ import {
 export function registerWorkflowTools(
   server: McpServer,
   client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
 ) {
   // ─── Setup / onboarding ───────────────────────────────────────────
   server.tool(
@@ -35,12 +54,16 @@ export function registerWorkflowTools(
     },
     readOnly,
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const sections: string[] = [];
 
         // 1. Health check
         let healthy = false;
         try {
+          // SDK gap: global.health() not present in v1 @opencode-ai/sdk
+          // (only v2 has it).  Fall back to legacy client.get.
+          // Source: https://opencode.ai/docs/sdk.md (v1 Global only has event())
           const health = (await client.get("/global/health", undefined, directory)) as Record<string, unknown>;
           healthy = true;
           sections.push(
@@ -58,7 +81,9 @@ export function registerWorkflowTools(
 
         // 2. Providers — categorize by readiness
         try {
-          const raw = await client.get("/provider", undefined, directory);
+          const raw = sdk
+            ? (await sdk.provider.list()).data
+            : await client.get("/provider", undefined, directory);
           const providers = (
             raw && typeof raw === "object" && "all" in (raw as Record<string, unknown>)
               ? (raw as Record<string, unknown>).all
@@ -69,7 +94,9 @@ export function registerWorkflowTools(
             // Fetch auth methods for richer guidance
             let authMethods: Record<string, unknown> | null = null;
             try {
-              authMethods = (await client.get("/provider/auth", undefined, directory)) as Record<string, unknown>;
+              authMethods = (sdk
+                ? (await sdk.provider.auth()).data
+                : await client.get("/provider/auth", undefined, directory)) as Record<string, unknown>;
             } catch { /* non-critical */ }
 
             // Helper to count models
@@ -167,7 +194,9 @@ export function registerWorkflowTools(
 
         // 3. Project info (if directory given or from default)
         try {
-          const project = (await client.get("/project/current", undefined, directory)) as Record<string, unknown>;
+          const project = (sdk
+            ? (await sdk.project.current()).data
+            : await client.get("/project/current", undefined, directory)) as Record<string, unknown>;
           const worktree = (project.worktree ?? "unknown") as string;
           // Derive a readable name: prefer project.name, then last dir component from worktree, then id
           const name = project.name
@@ -250,12 +279,13 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ prompt, title, providerID, modelID, variant, agent, system, directory }) => {
+      const sdk = sdkFactory?.(directory);
       let sessionId: string | undefined;
       try {
         // 1. Create session
-        const session = (await client.post("/session", {
-          title: title ?? prompt.slice(0, 80),
-        }, { directory })) as Record<string, unknown>;
+        const session = (sdk
+          ? (await sdk.session.create({ body: { title: title ?? prompt.slice(0, 80) } })).data
+          : await client.post("/session", { title: title ?? prompt.slice(0, 80) }, { directory })) as Record<string, unknown>;
         sessionId = session.id as string;
 
         // 2. Send prompt
@@ -267,11 +297,9 @@ export function registerWorkflowTools(
         if (agent) body.agent = agent;
         if (system) body.system = system;
 
-        const response = await client.post(
-          `/session/${sessionId}/message`,
-          body,
-          { directory },
-        );
+        const response = sdk
+          ? (await sdk.session.prompt({ path: { id: sessionId! }, body: body as any })).data
+          : await client.post(`/session/${sessionId}/message`, body, { directory });
 
         // 3. Analyze for auth / empty response issues
         const analysis = analyzeMessageResponse(response);
@@ -310,6 +338,7 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ sessionId, prompt, providerID, modelID, variant, agent, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text: prompt }],
@@ -318,11 +347,9 @@ export function registerWorkflowTools(
         if (model) body.model = model;
         if (agent) body.agent = agent;
 
-        const response = await client.post(
-          `/session/${sessionId}/message`,
-          body,
-          { directory },
-        );
+        const response = sdk
+          ? (await sdk.session.prompt({ path: { id: sessionId }, body: body as any })).data
+          : await client.post(`/session/${sessionId}/message`, body, { directory });
 
         const analysis = analyzeMessageResponse(response);
         const formatted = formatMessageResponse(response);
@@ -359,14 +386,13 @@ export function registerWorkflowTools(
     },
     readOnly,
     async ({ sessionId, limit, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const query: Record<string, string> = {};
         if (limit !== undefined) query.limit = String(limit);
-        const messages = await client.get(
-          `/session/${sessionId}/message`,
-          query,
-          directory,
-        );
+        const messages = sdk
+          ? (await sdk.session.messages({ path: { id: sessionId }, query: Object.keys(query).length > 0 ? { limit: Number(query.limit) } : undefined })).data
+          : await client.get(`/session/${sessionId}/message`, query, directory);
         const formatted = formatMessageList(
           messages as unknown[],
         );
@@ -386,10 +412,15 @@ export function registerWorkflowTools(
     },
     readOnly,
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const [sessions, statuses] = await Promise.all([
-          client.get("/session", undefined, directory) as Promise<Array<Record<string, unknown>>>,
-          client.get("/session/status", undefined, directory) as Promise<Record<string, unknown>>,
+          sdk
+            ? sdk.session.list().then((r) => r.data as Array<Record<string, unknown>>)
+            : client.get("/session", undefined, directory) as Promise<Array<Record<string, unknown>>>,
+          sdk
+            ? sdk.session.status().then((r) => r.data as Record<string, unknown>)
+            : client.get("/session/status", undefined, directory) as Promise<Record<string, unknown>>,
         ]);
 
         if (!sessions || sessions.length === 0) {
@@ -428,12 +459,24 @@ export function registerWorkflowTools(
         // swallows the validation error.
         directory = normalizeDirectory(directory) as typeof directory;
 
+        const sdk = sdkFactory?.(directory);
+
         const [project, path, vcs, config, agents] = await Promise.all([
-          client.get("/project/current", undefined, directory).catch(() => null),
-          client.get("/path", undefined, directory).catch(() => null),
-          client.get("/vcs", undefined, directory).catch(() => null),
-          client.get("/config", undefined, directory).catch(() => null),
-          client.get("/agent", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.project.current().then((r) => r.data).catch(() => null)
+            : client.get("/project/current", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.path.get().then((r) => r.data).catch(() => null)
+            : client.get("/path", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.vcs.get().then((r) => r.data).catch(() => null)
+            : client.get("/vcs", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.config.get().then((r) => r.data).catch(() => null)
+            : client.get("/config", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.app.agents().then((r) => r.data).catch(() => null)
+            : client.get("/agent", undefined, directory).catch(() => null),
         ]);
 
         const sections: string[] = [];
@@ -516,13 +559,16 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ sessionId, timeoutSeconds, pollIntervalMs, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const timeout = (timeoutSeconds ?? 120) * 1000;
         const interval = pollIntervalMs ?? 2000;
         const start = Date.now();
 
         while (Date.now() - start < timeout) {
-          const statuses = (await client.get("/session/status", undefined, directory)) as Record<
+          const statuses = (sdk
+            ? (await sdk.session.status()).data
+            : await client.get("/session/status", undefined, directory)) as Record<
             string,
             unknown
           >;
@@ -530,11 +576,9 @@ export function registerWorkflowTools(
 
           if (status === "idle" || status === "completed") {
             // Fetch latest messages
-            const messages = await client.get(
-              `/session/${sessionId}/message`,
-              { limit: "1" },
-              directory,
-            );
+            const messages = sdk
+              ? (await sdk.session.messages({ path: { id: sessionId }, query: { limit: 1 } })).data
+              : await client.get(`/session/${sessionId}/message`, { limit: "1" }, directory);
             const arr = messages as unknown[];
             if (arr.length > 0) {
               return toolResult(
@@ -576,10 +620,13 @@ export function registerWorkflowTools(
     },
     readOnly,
     async ({ sessionId, messageID, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const query: Record<string, string> = {};
         if (messageID) query.messageID = messageID;
-        const diffs = await client.get(`/session/${sessionId}/diff`, query, directory);
+        const diffs = sdk
+          ? (await sdk.session.diff({ path: { id: sessionId }, query: Object.keys(query).length > 0 ? query as any : undefined })).data
+          : await client.get(`/session/${sessionId}/diff`, query, directory);
         const { formatDiffResponse } = await import("../helpers.js");
         return toolResult(formatDiffResponse(diffs as unknown[]));
       } catch (e) {
@@ -599,12 +646,13 @@ export function registerWorkflowTools(
       directory: directoryParam,
     },
     async ({ providerId, modelID, variant, directory }) => {
+      const sdk = sdkFactory?.(directory);
       let sessionId: string | null = null;
       try {
         // 1. Create a temporary test session
-        const session = (await client.post("/session", {
-          title: `[test] ${providerId}`,
-        }, { directory })) as Record<string, unknown>;
+        const session = (sdk
+          ? (await sdk.session.create({ body: { title: `[test] ${providerId}` } })).data
+          : await client.post("/session", { title: `[test] ${providerId}` }, { directory })) as Record<string, unknown>;
         sessionId = session.id as string;
 
         // 2. Send a trivial prompt
@@ -618,11 +666,9 @@ export function registerWorkflowTools(
           body.providerID = providerId;
         }
 
-        const response = await client.post(
-          `/session/${sessionId}/message`,
-          body,
-          { directory },
-        );
+        const response = sdk
+          ? (await sdk.session.prompt({ path: { id: sessionId! }, body: body as any })).data
+          : await client.post(`/session/${sessionId}/message`, body, { directory });
 
         // 3. Analyze the response
         const analysis = analyzeMessageResponse(response);
@@ -630,7 +676,11 @@ export function registerWorkflowTools(
 
         // 4. Cleanup — delete test session
         try {
-          await client.delete(`/session/${sessionId}`, undefined, directory);
+          if (sdk) {
+            await sdk.session.delete({ path: { id: sessionId! } });
+          } else {
+            await client.delete(`/session/${sessionId}`, undefined, directory);
+          }
         } catch { /* best-effort cleanup */ }
 
         if (analysis.hasError || analysis.isEmpty) {
@@ -649,7 +699,11 @@ export function registerWorkflowTools(
         // Cleanup on error
         if (sessionId) {
           try {
-            await client.delete(`/session/${sessionId}`, undefined, directory);
+            if (sdk) {
+              await sdk.session.delete({ path: { id: sessionId } });
+            } else {
+              await client.delete(`/session/${sessionId}`, undefined, directory);
+            }
           } catch { /* best-effort cleanup */ }
         }
         return toolError(e);
@@ -680,12 +734,13 @@ export function registerWorkflowTools(
     },
     async ({ prompt, sessionId, title, providerID, modelID, variant, agent, maxDurationSeconds, directory }) => {
       let sid = sessionId;
+      const sdk = sdkFactory?.(directory);
       try {
         // 1. Create or reuse session
         if (!sid) {
-          const session = (await client.post("/session", {
-            title: title ?? prompt.slice(0, 80),
-          }, { directory })) as Record<string, unknown>;
+          const session = (sdk
+            ? (await sdk.session.create({ body: { title: title ?? prompt.slice(0, 80) } })).data
+            : await client.post("/session", { title: title ?? prompt.slice(0, 80) }, { directory })) as Record<string, unknown>;
           sid = session.id as string;
         }
 
@@ -698,7 +753,11 @@ export function registerWorkflowTools(
         if (model) body.model = model;
         if (agent) body.agent = agent;
 
-        await client.post(`/session/${sid}/message`, body, { directory });
+        if (sdk) {
+          await sdk.session.prompt({ path: { id: sid! }, body: body as any });
+        } else {
+          await client.post(`/session/${sid}/message`, body, { directory });
+        }
 
         // Session-directory consistency note
         const dirNote = sessionId && directory
@@ -714,23 +773,25 @@ export function registerWorkflowTools(
         while (Date.now() - start < timeout) {
           await new Promise((r) => setTimeout(r, interval));
 
-          const statuses = (await client.get("/session/status", undefined, directory)) as Record<string, unknown>;
+          const statuses = (sdk
+            ? (await sdk.session.status()).data
+            : await client.get("/session/status", undefined, directory)) as Record<string, unknown>;
           const status = resolveSessionStatus(statuses[sid!]);
 
           if (status === "idle" || status === "completed") {
             // Get final response
-            const messages = await client.get(
-              `/session/${sid}/message`,
-              { limit: "1" },
-              directory,
-            );
+            const messages = sdk
+              ? (await sdk.session.messages({ path: { id: sid! }, query: { limit: 1 } })).data
+              : await client.get(`/session/${sid}/message`, { limit: "1" }, directory);
             const arr = messages as unknown[];
             const lastMsg = arr.length > 0 ? formatMessageResponse(arr[arr.length - 1]) : "";
 
             // Get todo summary
             let todoSummary = "";
             try {
-              const todos = await client.get(`/session/${sid}/todo`, undefined, directory);
+              const todos = sdk
+                ? (await sdk.session.todo({ path: { id: sid! } })).data
+                : await client.get(`/session/${sid}/todo`, undefined, directory);
               if (Array.isArray(todos) && todos.length > 0) {
                 const completed = todos.filter((t: any) => t.status === "completed").length;
                 todoSummary = `\nTasks: ${completed}/${todos.length} completed`;
@@ -753,7 +814,9 @@ export function registerWorkflowTools(
         // Timeout — return progress report
         let todoProgress = "";
         try {
-          const todos = await client.get(`/session/${sid}/todo`, undefined, directory);
+          const todos = sdk
+            ? (await sdk.session.todo({ path: { id: sid! } })).data
+            : await client.get(`/session/${sid}/todo`, undefined, directory);
           if (Array.isArray(todos) && todos.length > 0) {
             const completed = todos.filter((t: any) => t.status === "completed").length;
             const inProgress = todos.filter((t: any) => t.status === "in_progress").length;
@@ -798,12 +861,13 @@ export function registerWorkflowTools(
     },
     async ({ prompt, sessionId, title, providerID, modelID, variant, agent, maxDurationSeconds, directory }, extra) => {
       let sid = sessionId;
+      const sdk = sdkFactory?.(directory);
       try {
         // 1. Create or reuse session
         if (!sid) {
-          const session = (await client.post("/session", {
-            title: title ?? prompt.slice(0, 80),
-          }, { directory })) as Record<string, unknown>;
+          const session = (sdk
+            ? (await sdk.session.create({ body: { title: title ?? prompt.slice(0, 80) } })).data
+            : await client.post("/session", { title: title ?? prompt.slice(0, 80) }, { directory })) as Record<string, unknown>;
           sid = session.id as string;
         }
 
@@ -811,14 +875,22 @@ export function registerWorkflowTools(
         //    "Source of truth"). The SSE connection must be established before
         //    the dispatch that triggers events, otherwise events fire while we
         //    are not listening and a fresh subscription only sees events
-        //    emitted after subscribe time. This is what client.event.subscribe()
-        //    does in the official @opencode-ai/sdk.
+        //    emitted after subscribe time.
         //
-        //    Use the global /event stream and filter by sessionID client-side.
-        //    Per-session /session/{sid}/event is not in the SDK and has caused
-        //    first-event-loss bugs historically — see commit 53aa725 +
-        //    AGENTS.md "SSE / streaming pattern".
+        //    With the typed SDK: sdk.event.subscribe() returns
+        //    { stream: AsyncGenerator<Event> } where each Event already has
+        //    { type: string, properties: Record<string, unknown> } — no
+        //    JSON.parse needed.  Events are filtered client-side by
+        //    sessionID.
+        //
+        //    When sdk is undefined (tests, legacy consumers), fall back to
+        //    client.subscribeSSE("/event", ...) — the existing SSE generator
+        //    yielding { event, data } pairs.  This ensures the test suite
+        //    (which mocks subscribeSSE, not event.subscribe) passes as-is.
+        //
+        //    See AGENTS.md "SSE / streaming pattern" + commit 53aa725.
         const maxMs = (maxDurationSeconds ?? 600) * 1000;
+        const start = Date.now();
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), maxMs);
 
@@ -833,13 +905,24 @@ export function registerWorkflowTools(
             }
           : () => {};
 
-        const stream = client.subscribeSSE("/event", { signal: controller.signal, directory });
-        const iter = stream[Symbol.asyncIterator]();
-        // Kick off the underlying fetch immediately so the SSE connection is
-        // in-flight before the POST below. We do NOT await — we want the POST
-        // to race in parallel so the server emits events while our reader is
-        // already listening. The promise resolves when the first event arrives.
-        const firstEventP = iter.next();
+        // Subscribe FIRST, POST AFTER — order is load-bearing (see commit 53aa725).
+        // With SDK: events already parsed into { type, properties }.
+        // With legacy: raw SSE yields { event, data } needing JSON.parse.
+        // We use a unified consume pipeline via a thin adapter.
+
+        let iter: AsyncIterator<any>;
+        let firstEventP: Promise<IteratorResult<any>>;
+
+        if (sdk) {
+          const events = await sdk.event.subscribe();
+          const stream = events.stream; // AsyncGenerator<Event>
+          iter = stream[Symbol.asyncIterator]();
+          firstEventP = iter.next();
+        } else {
+          const stream = client.subscribeSSE("/event", { signal: controller.signal, directory });
+          iter = stream[Symbol.asyncIterator]();
+          firstEventP = iter.next();
+        }
 
         // 3. Send prompt via canonical async endpoint /prompt_async.
         //    Returns 204 immediately, emits SSE events for progress + completion.
@@ -847,11 +930,12 @@ export function registerWorkflowTools(
         //    - /prompt           — does not exist on opencode 1.14.50, silently
         //                          accepted, never triggers the LLM (MEK-294)
         //    - /message          — synchronous, blocks the agent loop, returns
-        //                          AssistantMessage. Used by opencode_run,
-        //                          opencode_ask. Wrong for a streaming tool
+        //                          AssistantMessage.  Wrong for a streaming tool
         //                          because we'd miss session.idle (MEK-295)
         //    - /prompt_async     — fire-and-forget (204), emits SSE events.
         //                          Canonical for streaming dispatch.
+        //    SDK: sdk.session.promptAsync({path:{id:sid}, body}) confirmed in
+        //    @opencode-ai/sdk v1.15.3 unit — maps to POST /session/{id}/prompt_async.
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text: prompt }],
         };
@@ -859,7 +943,11 @@ export function registerWorkflowTools(
         if (model) body.model = model;
         if (agent) body.agent = agent;
 
-        await client.post(`/session/${sid}/prompt_async`, body, { directory });
+        if (sdk) {
+          await sdk.session.promptAsync({ path: { id: sid! }, body: body as any });
+        } else {
+          await client.post(`/session/${sid}/prompt_async`, body, { directory });
+        }
 
         // 4. Consume SSE until session.idle for our session.
         let eventCount = 0;
@@ -877,18 +965,27 @@ export function registerWorkflowTools(
           return false;
         };
 
-        const consumeEvent = (evt: { event: string; data: string }): boolean => {
-          let parsed: any;
-          try { parsed = JSON.parse(evt.data); } catch { return false; }
-          // Filter by sessionID — global /event mixes all sessions. Events
-          // without a sessionID (e.g. server.connected) are skipped silently.
-          const evtSid = parsed.properties?.sessionID;
+        // Unified consume: SDK events are already parsed { type, properties },
+        // legacy SSE yields { event, data } needing JSON.parse.
+        const consumeEvent = (item: any): boolean => {
+          let event: any;
+          if (item.data !== undefined) {
+            // Legacy SSE: { event: string, data: string }
+            try { event = JSON.parse(item.data); } catch { return false; }
+          } else {
+            // SDK: already-parsed { type, properties }
+            event = item;
+          }
+
+          // Filter by sessionID — global /event mixes all sessions
+          const evtSid = event.properties?.sessionID;
           if (!evtSid || evtSid !== sid) return false;
-          return processEvent(parsed);
+          return processEvent(event);
         };
 
         try {
           // Drain the in-flight first event (kicked off before POST).
+          // Do NOT reopen the stream — reopening loses events (commit 53aa725).
           const first = await firstEventP;
           if (!first.done && first.value) {
             consumeEvent(first.value);
@@ -896,9 +993,32 @@ export function registerWorkflowTools(
 
           if (!sawIdle) {
             while (true) {
-              const { done, value: evt } = await iter.next();
-              if (done) break;
-              if (consumeEvent(evt)) break;
+              // For the SDK path (no AbortSignal), race iter.next() against
+              // the remaining timeout so we don't hang forever.
+              const remainingMs = maxMs - (Date.now() - start);
+              if (remainingMs <= 0) break;
+
+              let result: IteratorResult<any>;
+              if (sdk) {
+                try {
+                  result = await Promise.race([
+                    iter.next(),
+                    new Promise<never>((_, reject) =>
+                      setTimeout(
+                        () => reject(new Error("SSE_TIMEOUT")),
+                        remainingMs,
+                      ),
+                    ),
+                  ]);
+                } catch {
+                  break; // timeout or stream error
+                }
+              } else {
+                result = await iter.next();
+              }
+
+              if (result.done) break;
+              if (consumeEvent(result.value)) break;
             }
           }
         } catch {
@@ -916,10 +1036,14 @@ export function registerWorkflowTools(
         }
 
         // 6. Double-check status (issue #3815: idle not deterministic)
-        const finalSession = (await client.get(`/session/${sid}`, undefined, directory)) as Record<string, unknown>;
+        const finalSession = (sdk
+          ? (await sdk.session.get({ path: { id: sid! } })).data
+          : await client.get(`/session/${sid}`, undefined, directory)) as Record<string, unknown>;
 
         // 7. Fetch final messages summary
-        const messages = (await client.get(`/session/${sid}/message`, undefined, directory)) as unknown[];
+        const messages = (sdk
+          ? (await sdk.session.messages({ path: { id: sid! } })).data
+          : await client.get(`/session/${sid}/message`, undefined, directory)) as unknown[];
         const formatted = formatMessageList(messages);
         const eventSummary = Object.entries(eventCounts)
           .map(([t, n]) => `${n}x ${t}`)
@@ -954,12 +1078,13 @@ export function registerWorkflowTools(
     },
     async ({ prompt, sessionId, title, providerID, modelID, variant, agent, directory }) => {
       let sid = sessionId;
+      const sdk = sdkFactory?.(directory);
       try {
         // 1. Create or reuse session
         if (!sid) {
-          const session = (await client.post("/session", {
-            title: title ?? prompt.slice(0, 80),
-          }, { directory })) as Record<string, unknown>;
+          const session = (sdk
+            ? (await sdk.session.create({ body: { title: title ?? prompt.slice(0, 80) } })).data
+            : await client.post("/session", { title: title ?? prompt.slice(0, 80) }, { directory })) as Record<string, unknown>;
           sid = session.id as string;
         }
 
@@ -972,7 +1097,11 @@ export function registerWorkflowTools(
         if (model) body.model = model;
         if (agent) body.agent = agent;
 
-        await client.post(`/session/${sid}/message`, body, { directory });
+        if (sdk) {
+          await sdk.session.prompt({ path: { id: sid! }, body: body as any });
+        } else {
+          await client.post(`/session/${sid}/message`, body, { directory });
+        }
 
         const dirLabel = directory ? `Directory: ${directory}\n` : "";
         return toolResult(
@@ -1007,15 +1136,25 @@ export function registerWorkflowTools(
         // Validate directory early — before .catch(() => null) swallows the error
         directory = normalizeDirectory(directory) as typeof directory;
 
+        const sdk = sdkFactory?.(directory);
+
         // Parallel fetch: status, todos, session info, optionally last message
         const promises: Promise<unknown>[] = [
-          client.get("/session/status", undefined, directory),
-          client.get(`/session/${sessionId}/todo`, undefined, directory).catch(() => null),
-          client.get(`/session/${sessionId}`, undefined, directory).catch(() => null),
+          sdk
+            ? sdk.session.status().then((r) => r.data)
+            : client.get("/session/status", undefined, directory),
+          sdk
+            ? sdk.session.todo({ path: { id: sessionId } }).then((r) => r.data).catch(() => null)
+            : client.get(`/session/${sessionId}/todo`, undefined, directory).catch(() => null),
+          sdk
+            ? sdk.session.get({ path: { id: sessionId } }).then((r) => r.data).catch(() => null)
+            : client.get(`/session/${sessionId}`, undefined, directory).catch(() => null),
         ];
         if (detailed) {
           promises.push(
-            client.get(`/session/${sessionId}/message`, { limit: "1" }, directory).catch(() => null),
+            sdk
+              ? sdk.session.messages({ path: { id: sessionId }, query: { limit: 1 } }).then((r) => r.data).catch(() => null)
+              : client.get(`/session/${sessionId}/message`, { limit: "1" }, directory).catch(() => null),
           );
         }
 
@@ -1052,7 +1191,9 @@ export function registerWorkflowTools(
 
         // File changes count (from diff endpoint)
         try {
-          const diffs = await client.get(`/session/${sessionId}/diff`, undefined, directory) as unknown[];
+          const diffs = (sdk
+            ? (await sdk.session.diff({ path: { id: sessionId } })).data
+            : await client.get(`/session/${sessionId}/diff`, undefined, directory)) as unknown[];
           if (Array.isArray(diffs) && diffs.length > 0) {
             lines.push(`Files changed: ${diffs.length}`);
           }
@@ -1095,11 +1236,20 @@ export function registerWorkflowTools(
         // swallows the validation error.
         directory = normalizeDirectory(directory) as typeof directory;
 
+        const sdk = sdkFactory?.(directory);
+
         const [health, providerRaw, sessions, vcs] = await Promise.all([
+          // SDK gap: global.health() not present in v1 @opencode-ai/sdk
           client.get("/global/health", undefined, directory).catch(() => null),
-          client.get("/provider", undefined, directory).catch(() => null),
-          client.get("/session", undefined, directory).catch(() => null),
-          client.get("/vcs", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.provider.list().then((r) => r.data).catch(() => null)
+            : client.get("/provider", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.session.list().then((r) => r.data).catch(() => null)
+            : client.get("/session", undefined, directory).catch(() => null),
+          sdk
+            ? sdk.vcs.get().then((r) => r.data).catch(() => null)
+            : client.get("/vcs", undefined, directory).catch(() => null),
         ]);
 
         const lines: string[] = [];

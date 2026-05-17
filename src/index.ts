@@ -32,6 +32,8 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { OpenCodeClient } from "./client.js";
+import { createCoworkClient } from "./sdk-adapter.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import { ensureServer } from "./server-manager.js";
 import { setModelDefaults } from "./helpers.js";
 
@@ -68,6 +70,29 @@ const exProvider = defaultProvider || "<your-provider>";
 const exModel = defaultModel || "<your-model>";
 
 const client = new OpenCodeClient({ baseUrl, username, password, autoServe });
+
+// Phase C (MEK-297 + MEK-289): per-directory SDK client cache.
+// Cowork MCP tools receive `directory` per-call (different projects per
+// request), but createCoworkClient bakes `directory` into the customFetch
+// closure at construction time (sdk-adapter.ts:180+222).  A single shared
+// sdkClient created without `directory` therefore drops the per-call
+// directory, silently re-targeting the server's default project.  We
+// cache by raw directory key (normalizeDirectory is invoked inside
+// createCoworkClient — the same raw input yields the same normalized
+// result) to avoid recreating the SDK client on every tool call while
+// preserving per-call directory propagation.
+//
+// The idempotency map is module-scoped in sdk-adapter.ts, so dedup still
+// works across all clients in the cache.
+const sdkCache = new Map<string, OpencodeClient>();
+const sdkFactory = (directory?: string): OpencodeClient => {
+  const key = directory ?? "__default__";
+  const cached = sdkCache.get(key);
+  if (cached) return cached;
+  const created = createCoworkClient({ baseUrl, username, password, autoServe, directory });
+  sdkCache.set(key, created);
+  return created;
+};
 
 const server = new McpServer(
   {
@@ -178,7 +203,7 @@ registerProviderTools(server, client);
 registerMiscTools(server, client);
 
 // ── High-level workflow tools ───────────────────────────────────────
-registerWorkflowTools(server, client);
+registerWorkflowTools(server, client, sdkFactory);
 
 // ── TUI control ─────────────────────────────────────────────────────
 registerTuiTools(server, client);
