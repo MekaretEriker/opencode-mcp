@@ -9,10 +9,7 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
-## [Unreleased] — target `1.11.0-mekareteriker.0`
-
-Batched release covering MEK-282, MEK-283, MEK-284, MEK-289. Will bump to `1.11.0-mekareteriker.0`
-(minor — adds the new `opencode_run_streaming` tool from MEK-283).
+## [1.11.0-mekareteriker.0] - 2026-05-17
 
 ### Fixed
 
@@ -80,6 +77,30 @@ Batched release covering MEK-282, MEK-283, MEK-284, MEK-289. Will bump to `1.11.
     `beforeEach` to assert legacy validation-only behavior.
 
 ### Added
+
+- `[fork]` **MEK-283 — `opencode_run_streaming`: SSE-backed run tool (minor bump = new public tool).**
+  New workflow tool that mirrors `opencode_run` but consumes the OpenCode server's
+  `text/event-stream` instead of polling `/session/{id}` every 3s. Returns when
+  `session.idle` fires for the target session. Emits MCP `notifications/progress`
+  to the client iff a `progressToken` was passed in the call params
+  (per [MCP progress spec](https://spec.modelcontextprotocol.io/specification/server/utilities/progress/));
+  otherwise silently waits — backward-compat preserved for clients without progress support.
+  - Canonical POST endpoint is `/session/{id}/prompt` (not `/message`), aligned with the OpenCode SDK.
+  - SSE strategy: try per-session `/session/{id}/event` first, fall back to global `/event` with
+    server-side `sessionID` filtering when per-session returns HTML (e.g. SPA fallback). Probe uses
+    `iter.next()` + `Promise.race` against a 500ms timeout so a silent stream falls back fast
+    without losing the first event (single connection per path — the probed event is forwarded
+    to the main loop).
+  - Workaround for [opencode issue #3815](https://github.com/anomalyco/opencode/issues/3815):
+    after `session.idle`, re-fetch `GET /session/{id}` to confirm the idle state isn't racy.
+  - On timeout without `session.idle`, returns the new structured error code `SESSION_HANG`
+    (MEK-282) with the sessionId for debugging — no destructive retry (MEK-281). Mapped in
+    `buildStructuredError` from the message pattern `did not emit session.idle within Xs`.
+  - Bonus latent fix: `subscribeSSE` now forwards the `directory` header, so multi-project
+    Cowork deployments get correctly scoped streams via `events.ts` too.
+  - 4 new tests in `tests/tools.test.ts` (happy path, `/event` fallback when per-session returns
+    HTML, `SESSION_HANG` on timeout, `sessionID` filtering on `/event`). Total: 346 passed,
+    5 skipped, 0 failed.
 
 - `[fork]` **MEK-284 — Idempotency layer for POST/PUT/PATCH.** In-flight or recently-resolved
   non-idempotent requests with identical `(method, path, body)` are deduplicated transparently
