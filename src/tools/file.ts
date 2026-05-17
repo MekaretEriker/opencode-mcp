@@ -1,9 +1,45 @@
+/**
+ * File tools — find text, find files, find symbols, list directory, read file
+ * content, check VCS file status.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  When `sdkFactory` is
+ * undefined (tests, legacy consumers), the handler falls back to the
+ * legacy `OpenCodeClient.get` methods, which propagate `directory`
+ * per-request via the `{directory}` option.
+ *
+ * All 6 tools mapped to typed SDK methods — one partial gap:
+ * - `sdk.find.text()`      → GET  /find
+ * - `sdk.find.files()`     → GET  /find/file (SDK types omit `searchDirectory`
+ *   and `limit` query params; legacy fallback handles full param set)
+ * - `sdk.find.symbols()`   → GET  /find/symbol
+ * - `sdk.file.list()`      → GET  /file
+ * - `sdk.file.read()`      → GET  /file/content
+ * - `sdk.file.status()`    → GET  /file/status
+ *
+ * SDK types handled correctly:
+ * - `FindTextData`        — query.pattern only (directory handled by factory)
+ * - `FindFilesData`       — query.query + query.dirs (directory handled by factory)
+ * - `FindSymbolsData`     — query.query only (directory handled by factory)
+ * - `FileListData`        — query.path only (directory handled by factory)
+ * - `FileReadData`        — query.path only (directory handled by factory)
+ * - `FileStatusData`      — no required params (directory handled by factory)
+ */
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import { toolJson, toolError, toolResult, directoryParam, readOnly } from "../helpers.js";
 
-export function registerFileTools(server: McpServer, client: OpenCodeClient) {
+export function registerFileTools(
+  server: McpServer,
+  client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
+) {
   server.tool(
     "opencode_find_text",
     "Search for text patterns in project files (regex supported). Returns file paths, line numbers, and matching lines.",
@@ -15,8 +51,11 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ pattern, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/find", { pattern }, directory);
+        const raw = sdk
+          ? (await sdk.find.text({ query: { pattern } })).data
+          : await client.get("/find", { pattern }, directory);
         const results = Array.isArray(raw) ? raw as Array<Record<string, unknown>> : [];
         if (results.length === 0) {
           return toolResult(`No matches found for pattern: ${pattern}`);
@@ -64,7 +103,22 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ query, type, searchDirectory, limit, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
+        // SDK gap: FindFilesData only types `query.query` and `query.dirs` —
+        // `searchDirectory` and `limit` are not in the SDK type. Fall back
+        // to legacy client when those extra params are used.
+        // (https://opencode.ai/docs/sdk.md)
+        if (sdk && !searchDirectory && limit === undefined) {
+          const sdkQ: { query: string; dirs?: "true" | "false" } = { query };
+          if (type === "directory") sdkQ.dirs = "true";
+          const files = (await sdk.find.files({ query: sdkQ })).data as string[];
+          if (!files || files.length === 0) {
+            return toolResult(`No files found matching: ${query}`);
+          }
+          return toolResult(files.join("\n"));
+        }
+
         const q: Record<string, string> = { query };
         if (type) q.type = type;
         if (searchDirectory) q.directory = searchDirectory;
@@ -89,8 +143,11 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ query, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/find/symbol", { query }, directory);
+        const raw = sdk
+          ? (await sdk.find.symbols({ query: { query } })).data
+          : await client.get("/find/symbol", { query }, directory);
         const symbols = Array.isArray(raw) ? raw as Array<Record<string, unknown>> : [];
         if (symbols.length === 0) {
           return toolResult(`No symbols found matching: ${query}`);
@@ -122,9 +179,11 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ path, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const q: Record<string, string> = { path: path || "." };
-        const nodes = (await client.get("/file", q, directory)) as Array<Record<string, unknown>>;
+        const nodes = sdk
+          ? (await sdk.file.list({ query: { path: path || "." } })).data as Array<Record<string, unknown>>
+          : (await client.get("/file", { path: path || "." }, directory)) as Array<Record<string, unknown>>;
         if (!nodes || nodes.length === 0) {
           return toolResult("Empty directory.");
         }
@@ -148,8 +207,11 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ path, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const result = (await client.get("/file/content", { path }, directory)) as Record<string, unknown>;
+        const result = sdk
+          ? (await sdk.file.read({ query: { path } })).data as Record<string, unknown>
+          : (await client.get("/file/content", { path }, directory)) as Record<string, unknown>;
         if (typeof result.content === "string") {
           return toolResult(`File: ${path}\n\n${result.content}`);
         }
@@ -168,8 +230,11 @@ export function registerFileTools(server: McpServer, client: OpenCodeClient) {
     },
     readOnly,
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const files = (await client.get("/file/status", undefined, directory)) as Array<Record<string, unknown>>;
+        const files = sdk
+          ? (await sdk.file.status()).data as Array<Record<string, unknown>>
+          : (await client.get("/file/status", undefined, directory)) as Array<Record<string, unknown>>;
         if (!files || files.length === 0) {
           return toolResult("No tracked file changes.");
         }
