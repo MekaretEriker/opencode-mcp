@@ -64,6 +64,10 @@ describe("SDK adapter (createCoworkClient)", () => {
   // ─────────────────────────────────────────────────────────────────────
 
   describe("directory header injection (MEK-289)", () => {
+    beforeEach(() => {
+      vi.stubEnv("OPENCODE_MCP_TRANSLATE_PATHS", "none");
+    });
+
     it("injects x-opencode-directory header when a valid directory is provided", async () => {
       const { tmpdir } = await import("node:os");
       const dir = tmpdir();

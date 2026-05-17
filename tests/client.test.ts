@@ -1,4 +1,4 @@
-import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { describe, it, expect, vi, beforeEach, afterEach, beforeAll, afterAll } from "vitest";
 import { tmpdir } from "node:os";
 
 const TMP = tmpdir();
@@ -463,6 +463,13 @@ describe("OpenCodeClient", () => {
   });
 
   describe("directory header", () => {
+    beforeAll(() => {
+      process.env.OPENCODE_MCP_TRANSLATE_PATHS = "none";
+    });
+    afterAll(() => {
+      delete process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    });
+
     it("sets x-opencode-directory header on GET when directory is provided", async () => {
       fetchMock.mockResolvedValue(mockResponse({}));
       const client = createClient();
