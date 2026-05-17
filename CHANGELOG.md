@@ -9,6 +9,28 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.11.1-mekareteriker.0] - 2026-05-17
+
+### Fixed
+
+- `[fork]` **MEK-294 — Hotfix `opencode_run_streaming` endpoint cassé.**
+  v1.11.0-mekareteriker.0 a shipped `opencode_run_streaming` (MEK-283) avec un POST
+  sur `/session/{sid}/prompt`. Sur opencode server 1.14.50, cet endpoint est accepté
+  silencieusement (200 OK) mais ne déclenche **aucune exécution LLM** — la session
+  est créée, reste vierge (Updated == Created, 0 user message, 0 assistant message),
+  puis remonte un `SESSION_HANG` au bout de `maxDurationSeconds`. Confirmé en e2e
+  le 2026-05-17 avec 3 modèles distincts.
+  - Fix : switch `POST /session/{sid}/prompt` → `POST /session/{sid}/message` dans
+    `src/tools/workflow.ts` (la registration de `opencode_run_streaming`). `/message`
+    est l'endpoint canonique déjà utilisé par `opencode_run` et avéré fonctionnel.
+  - Tests : `tests/tools.test.ts` describe `opencode_run_streaming` (4 tests) — les
+    mocks `post` matchent maintenant `/message` au lieu de `/prompt`. Baseline
+    préservée : 346 passed, 5 skipped, 0 failed.
+  - Pourquoi les unit tests n'ont pas attrapé le bug : mock pitfall documenté dans
+    `AGENTS.md` — `subscribeSSE` yieldait `session.idle` peu importe l'endpoint POST
+    appelé. Un mock qui yield des events ne valide PAS que le serveur accepte
+    l'endpoint POST. Validation manuelle en live ajoutée à la procédure release.
+
 ## [1.11.0-mekareteriker.0] - 2026-05-17
 
 ### Fixed
