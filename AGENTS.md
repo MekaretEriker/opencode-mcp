@@ -4,8 +4,14 @@ Hardened fork of `opencode-mcp` with cross-platform fixes for Cowork deployments
 See `SPEC-fork.md` for the audit trail of forked changes versus upstream
 `AlaeddineMessadi/opencode-mcp`.
 
-This file documents operational lessons that aren't obvious from reading the
-code. Read it before touching the release pipeline or `subscribeSSE`.
+This file documents **engineering invariants** that any build agent (OpenCode,
+Cowork's Claude, Cline, etc.) must respect when modifying the codebase: SDK
+source-of-truth rule, SSE patterns, error handling, testing conventions.
+
+For **operational workflow** (release management, versioning, issue tracking,
+CHANGELOG conventions), see `CLAUDE.md` in the same directory. Cowork's Claude
+typically drives those workflows; they're kept separate so the engineering
+rules stay focused.
 
 ## Source of truth — opencode SDK first, Hermes reference second
 
@@ -77,47 +83,6 @@ expose — wrap the SDK client rather than bypassing it. The fallback to raw
 `fetch` should be the **last** option, documented in code with a link to the
 SDK gap that motivated it.
 
-## Release workflow
-
-The repo has a GitHub Actions workflow (`.github/workflows/release.yml`) that
-auto-publishes to npm with provenance when a tag matching `v*` is pushed. The
-local release ritual:
-
-1. **Bump version** in `package.json`. Semver:
-   - Minor (`1.10.x` → `1.11.0`) — new public tool, new env var, new exported
-     helper. Anything a consumer can call.
-   - Patch (`1.10.2` → `1.10.3`) — bug fix, internal refactor, retry policy
-     change. Anything transparent.
-2. **Move `[Unreleased]` entries** in `CHANGELOG.md` under a dated version
-   header (`## [X.Y.Z-mekareteriker.N] - YYYY-MM-DD`). Drop the "Batched
-   release covering MEK-…" lead-in if present.
-3. **Two commits**:
-   - `feat(scope): MEK-XXX — subject` (or `fix`) for the code.
-   - `chore(release): vX.Y.Z-mekareteriker.N` for the version bump + CHANGELOG.
-   The split keeps the release commit isolable and revertable.
-4. **Tag and push**:
-   ```bash
-   git tag vX.Y.Z-mekareteriker.N
-   git push origin main
-   git push origin vX.Y.Z-mekareteriker.N
-   ```
-   Do NOT rely on `git push --follow-tags` — it only pushes annotated tags,
-   not lightweight ones. Push the tag explicitly or use `git tag -a` upstream.
-5. **CI auto-publishes** to npm. Verify with
-   `npm view @mekareteriker/opencode-mcp@X.Y.Z-mekareteriker.N version`.
-
-## Semver gotcha: caret + prerelease is strict
-
-The fork uses prerelease tags (`-mekareteriker.N`). npm's caret semantics with
-prereleases are **strict**: `^1.10.2-mekareteriker.0` matches other prereleases
-of `1.10.2` only — it does NOT match `1.11.0-mekareteriker.0`. Consumers
-(`opencode-agent/.mcp.json`, etc.) must explicitly bump their range when a new
-minor or major version ships. This caught us during the `opencode-agent v1.0.3
-→ v1.1.0` bump — the `.mcp.json` was silently pinned to the old minor.
-
-When bumping minor, ping downstream consumers (currently just `opencode-agent`)
-to update their dep range.
-
 ## SSE / streaming pattern
 
 `OpenCodeClient.subscribeSSE(path, opts?)` is an async generator yielding
@@ -171,20 +136,3 @@ the error fires before session creation.
   the stream, the mock will still see the events but production won't. When
   testing SSE consumers, treat each connection as one-shot.
 
-## Linear sync convention
-
-Commits referencing a Linear ticket should use one of the magic keywords:
-
-- `Closes MEK-XXX`
-- `Fixes MEK-XXX`
-- `Resolves MEK-XXX`
-
-A bare `MEK-XXX` mention in the subject (e.g. `feat(workflow): MEK-283 — …`)
-does NOT trigger auto-close. Linear's GitHub integration (`Issue linking`,
-org-level) parses the magic keyword on push to `main` and moves the linked
-ticket to Done. Mention the keyword anywhere in the commit body — start, end,
-middle, all work.
-
-The org-level integration handles `opencode-mcp` even though the GitHub Issues
-sync is configured on `opencode-agent-for-cowork` — they are two separate
-features.
