@@ -197,7 +197,7 @@ registerGlobalTools(server, client);
 registerConfigTools(server, client);
 registerProjectTools(server, client);
 registerSessionTools(server, client);
-registerMessageTools(server, client);
+registerMessageTools(server, client, sdkFactory);
 registerFileTools(server, client);
 registerProviderTools(server, client);
 registerMiscTools(server, client);

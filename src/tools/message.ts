@@ -1,6 +1,30 @@
+/**
+ * Message tools — send prompts, list history, execute commands/shell.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  A global cache in
+ * `src/index.ts` ensures equivalent directories share a client instance.
+ *
+ * When `sdkFactory` is undefined (tests, legacy consumers), the handler
+ * falls back to the legacy `OpenCodeClient.post/get` methods, which
+ * propagate `directory` per-request via the `{directory}` option.
+ *
+ * All 6 tools mapped to typed SDK methods — no gaps:
+ * - `sdk.session.messages()`    → GET  /session/{id}/message (list)
+ * - `sdk.session.message()`     → GET  /session/{id}/message/{messageID} (single)
+ * - `sdk.session.prompt()`      → POST /session/{id}/message (sync)
+ * - `sdk.session.promptAsync()` → POST /session/{id}/prompt_async
+ * - `sdk.session.command()`     → POST /session/{id}/command
+ * - `sdk.session.shell()`       → POST /session/{id}/shell
+ */
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import {
   toolResult,
   toolError,
@@ -14,6 +38,7 @@ import {
 export function registerMessageTools(
   server: McpServer,
   client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
 ) {
   server.tool(
     "opencode_message_list",
@@ -27,14 +52,17 @@ export function registerMessageTools(
       directory: directoryParam,
     },
     async ({ sessionId, limit, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const query: Record<string, string> = {};
         if (limit !== undefined) query.limit = String(limit);
-        const messages = await client.get(
-          `/session/${sessionId}/message`,
-          query,
-          directory,
-        );
+        const messages = sdk
+          ? (await sdk.session.messages({ path: { id: sessionId }, query: Object.keys(query).length > 0 ? { limit: Number(query.limit) } : undefined })).data
+          : await client.get(
+              `/session/${sessionId}/message`,
+              query,
+              directory,
+            );
         return toolResult(formatMessageList(messages as unknown[]));
       } catch (e) {
         return toolError(e);
@@ -51,12 +79,15 @@ export function registerMessageTools(
       directory: directoryParam,
     },
     async ({ sessionId, messageId, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const msg = await client.get(
-          `/session/${sessionId}/message/${messageId}`,
-          undefined,
-          directory,
-        );
+        const msg = sdk
+          ? (await sdk.session.message({ path: { id: sessionId, messageID: messageId } })).data
+          : await client.get(
+              `/session/${sessionId}/message/${messageId}`,
+              undefined,
+              directory,
+            );
         return toolResult(formatMessageResponse(msg));
       } catch (e) {
         return toolError(e);
@@ -100,6 +131,7 @@ export function registerMessageTools(
       system,
       directory,
     }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text }],
@@ -109,11 +141,13 @@ export function registerMessageTools(
         if (agent) body.agent = agent;
         if (noReply !== undefined) body.noReply = noReply;
         if (system) body.system = system;
-        const response = await client.post(
-          `/session/${sessionId}/message`,
-          body,
-          { directory },
-        );
+        const response = sdk
+          ? (await sdk.session.prompt({ path: { id: sessionId }, body: body as any })).data
+          : await client.post(
+              `/session/${sessionId}/message`,
+              body,
+              { directory },
+            );
 
         const analysis = analyzeMessageResponse(response);
         const formatted = formatMessageResponse(response);
@@ -151,6 +185,7 @@ export function registerMessageTools(
       directory: directoryParam,
     },
     async ({ sessionId, text, providerID, modelID, variant, agent, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text }],
@@ -158,7 +193,11 @@ export function registerMessageTools(
         const model = applyModelDefaults(providerID, modelID, variant);
         if (model) body.model = model;
         if (agent) body.agent = agent;
-        await client.post(`/session/${sessionId}/prompt_async`, body, { directory });
+        if (sdk) {
+          await sdk.session.promptAsync({ path: { id: sessionId }, body: body as any });
+        } else {
+          await client.post(`/session/${sessionId}/prompt_async`, body, { directory });
+        }
         return toolResult(
           "Message sent asynchronously. Use opencode_wait or opencode_message_list to check for responses.",
         );
@@ -196,6 +235,7 @@ export function registerMessageTools(
       variant,
       directory,
     }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, unknown> = {
           command,
@@ -204,11 +244,13 @@ export function registerMessageTools(
         if (agent) body.agent = agent;
         const cmdModel = applyModelDefaults(providerID, modelID, variant);
         if (cmdModel) body.model = cmdModel;
-        const result = await client.post(
-          `/session/${sessionId}/command`,
-          body,
-          { directory },
-        );
+        const result = sdk
+          ? (await sdk.session.command({ path: { id: sessionId }, body: body as any })).data
+          : await client.post(
+              `/session/${sessionId}/command`,
+              body,
+              { directory },
+            );
         return toolResult(formatMessageResponse(result));
       } catch (e) {
         return toolError(e, { providerID, modelID, sessionId });
@@ -229,15 +271,18 @@ export function registerMessageTools(
       directory: directoryParam,
     },
     async ({ sessionId, command, agent, providerID, modelID, variant, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, unknown> = { command, agent };
         const shellModel = applyModelDefaults(providerID, modelID, variant);
         if (shellModel) body.model = shellModel;
-        const result = await client.post(
-          `/session/${sessionId}/shell`,
-          body,
-          { directory },
-        );
+        const result = sdk
+          ? (await sdk.session.shell({ path: { id: sessionId }, body: body as any })).data
+          : await client.post(
+              `/session/${sessionId}/shell`,
+              body,
+              { directory },
+            );
         return toolResult(formatMessageResponse(result));
       } catch (e) {
         return toolError(e, { providerID, modelID, sessionId });
