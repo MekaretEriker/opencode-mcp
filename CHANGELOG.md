@@ -9,7 +9,7 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
-## [Unreleased]
+## [1.12.0-mekareteriker.0] - 2026-05-17
 
 ### Added
 
@@ -40,6 +40,78 @@ Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
   multi-POST tests are restored and pass. This validates the broader MEK-294/295
   lesson: when a symptom points at an external bug, reproduce it in isolation
   before accepting the workaround. See AGENTS.md "Source of truth" for the rule.
+
+### Changed
+
+- `[fork]` **MEK-297 — Phase C: migrate all `tools/*.ts` from hand-rolled HTTP to typed SDK methods.**
+  All 9 tool files (~67 tools total) now use the typed `@opencode-ai/sdk` client
+  via a per-directory `sdkFactory` cache plumbed through `src/index.ts`. Each
+  handler resolves `const sdk = sdkFactory?.(directory)` at the top, then uses
+  `sdk ? sdk.x(...) : client.x(...)` branches. The legacy `OpenCodeClient` is
+  kept as fallback when `sdkFactory` is undefined (tests, legacy consumers calling
+  `registerXxxTools` with 2 args). Strategy B chosen over Strategy A (façade on
+  `OpenCodeClient`): zero changes to `client.ts`, zero changes to tests, baseline
+  363 passed / 5 skipped / 0 failed preserved at every commit.
+
+  **Per-directory factory cache (`Map<string, OpencodeClient>`)** preserves the
+  MEK-289 per-call `directory` propagation in production. Without it, the
+  baked-at-construction `normalizedDirectory` in `createCoworkClient`'s closure
+  would silently drop the per-call `directory` parameter for multi-project
+  deployments. Module-scoped idempotency map in `sdk-adapter.ts` ensures dedup
+  still works across all cached clients.
+
+  **9 granular commits**, one per file, each closing a dedicated GitHub issue:
+  - `2c1d2ef` workflow.ts (14 tools)  — #15
+  - `13b0e28` message.ts (6 tools)    — #16
+  - `c66296e` session.ts (20 tools)   — #17
+  - `db21c52` file.ts (6 tools)       — #18
+  - `0cee235` project.ts (2 tools)    — #19
+  - `36de1af` config.ts (3 tools)     — #20
+  - `17fe748` provider.ts (6 tools)   — #21
+  - `eb39dd6` tui.ts (9 tools)        — #22
+  - `5a80bc4` events.ts (1 tool)      — #23
+
+  **3 SDK gaps documented in-code** (kept raw `client.x()` with explanatory comment):
+  - `client.get("/global/health")` in `workflow.ts:opencode_setup` and
+    `workflow.ts:opencode_status` — `sdk.global.health()` not in v1
+    `@opencode-ai/sdk`'s `Global` class (only `event()`); `health()` exists only
+    in the unreleased `@opencode-ai/sdk/v2`.
+  - `AbortSignal` handling for SSE in `workflow.ts:opencode_run_streaming` and
+    `events.ts:opencode_events_poll` — `sdk.event.subscribe()` returns
+    `{stream: AsyncGenerator<Event>}` with no abort hook; replaced
+    `controller.signal` pattern with `Promise.race` against the remaining
+    timeout deadline. Streaming preserves the load-bearing subscribe-FIRST,
+    drain-first-event-without-reopen contract from commit `53aa725`.
+  - `client.post("/provider/{id}/oauth/callback")` in `provider.ts` —
+    `sdk.provider.oauth.callback()` only exposes `{code?: string}` in its
+    typed body, but the legacy endpoint accepts arbitrary
+    `Record<string, unknown>`; the wider shape is required by some providers.
+
+  **SDK quirk noted**: `sdk.postSessionIdPermissionsPermissionId()` is
+  auto-named by the SDK code generator due to a missing OpenAPI `tags`
+  field on that operation. Kept verbatim in `session.ts` since the typed
+  signature still provides type safety; an upstream fix to the OpenAPI spec
+  would rename it to `sdk.session.permission.respond()` or similar.
+
+  **MCP tool surface is unchanged** — all zod schemas, parameter names,
+  response formats, and error structures (`toolResult` / `toolError`,
+  structured error codes) are identical to pre-Phase-C. Consumers
+  (Cowork's `opencode-agent` plugin, Cline, Hermes, custom scripts) need no
+  code changes; only the `.mcp.json` range bump from `^1.11.2-mekareteriker.0`
+  to `^1.12.0-mekareteriker.0` is required (caret + prerelease semver gotcha
+  documented in both repos' `CLAUDE.md`).
+
+  **`OpenCodeClient` post-Phase-C status**: kept fully functional. It is no
+  longer the primary path in production (the SDK branch is taken when
+  `sdkFactory` is provided), but it remains the fallback for the existing
+  test harness and any consumer still calling `registerXxxTools(server, client)`
+  with 2 args. A follow-up may mark it `@deprecated` and migrate the test
+  harness once the SDK path is exercised in real Cowork deployments.
+
+  Tests at every commit: 363 passed, 5 skipped, 0 failed across 7 files.
+  `tsc --noEmit`: 0 errors at every commit.
+
+  Legacy Linear: MEK-297. Closes #15-#23.
 
 ## [1.11.2-mekareteriker.0] - 2026-05-17
 
