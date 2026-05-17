@@ -206,7 +206,7 @@ registerMiscTools(server, client);
 registerWorkflowTools(server, client, sdkFactory);
 
 // ── TUI control ─────────────────────────────────────────────────────
-registerTuiTools(server, client);
+registerTuiTools(server, client, sdkFactory);
 
 // ── Event streaming ─────────────────────────────────────────────────
 registerEventTools(server, client);

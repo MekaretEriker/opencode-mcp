@@ -1,14 +1,23 @@
 /**
  * TUI control tools — drive the OpenCode TUI remotely.
  * Useful for IDE integrations and automation.
+ *
+ * Phase C (MEK-297): migrated from raw `client.post("/tui/*", ...)` to typed
+ * `sdk.tui.*` methods with legacy fallback.  All nine TUI tools map 1-to-1 to
+ * SDK methods (no gaps).
  */
 
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import { OpenCodeClient } from "../client.js";
 import { toolResult, toolError, directoryParam } from "../helpers.js";
 
-export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
+export function registerTuiTools(
+  server: McpServer,
+  client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
+) {
   server.tool(
     "opencode_tui_append_prompt",
     "Append text to the TUI's prompt input field",
@@ -17,8 +26,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ text, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/append-prompt", { text }, { directory });
+        if (sdk) {
+          await sdk.tui.appendPrompt({ body: { text } });
+        } else {
+          await client.post("/tui/append-prompt", { text }, { directory });
+        }
         return toolResult("Text appended to prompt.");
       } catch (e) {
         return toolError(e);
@@ -33,8 +47,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/submit-prompt", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.submitPrompt();
+        } else {
+          await client.post("/tui/submit-prompt", undefined, { directory });
+        }
         return toolResult("Prompt submitted.");
       } catch (e) {
         return toolError(e);
@@ -49,8 +68,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/clear-prompt", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.clearPrompt();
+        } else {
+          await client.post("/tui/clear-prompt", undefined, { directory });
+        }
         return toolResult("Prompt cleared.");
       } catch (e) {
         return toolError(e);
@@ -66,8 +90,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ command, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/execute-command", { command }, { directory });
+        if (sdk) {
+          await sdk.tui.executeCommand({ body: { command } });
+        } else {
+          await client.post("/tui/execute-command", { command }, { directory });
+        }
         return toolResult(`Command '${command}' executed.`);
       } catch (e) {
         return toolError(e);
@@ -88,11 +117,18 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ message, title, variant, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const body: Record<string, string> = { message };
-        if (title) body.title = title;
-        if (variant) body.variant = variant;
-        await client.post("/tui/show-toast", body, { directory });
+        if (sdk) {
+          await sdk.tui.showToast({
+            body: { message, title, variant: variant ?? "info" },
+          });
+        } else {
+          const body: Record<string, string> = { message };
+          if (title) body.title = title;
+          if (variant) body.variant = variant;
+          await client.post("/tui/show-toast", body, { directory });
+        }
         return toolResult("Toast shown.");
       } catch (e) {
         return toolError(e);
@@ -107,8 +143,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/open-help", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.openHelp();
+        } else {
+          await client.post("/tui/open-help", undefined, { directory });
+        }
         return toolResult("Help dialog opened.");
       } catch (e) {
         return toolError(e);
@@ -123,8 +164,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/open-sessions", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.openSessions();
+        } else {
+          await client.post("/tui/open-sessions", undefined, { directory });
+        }
         return toolResult("Session selector opened.");
       } catch (e) {
         return toolError(e);
@@ -139,8 +185,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/open-models", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.openModels();
+        } else {
+          await client.post("/tui/open-models", undefined, { directory });
+        }
         return toolResult("Model selector opened.");
       } catch (e) {
         return toolError(e);
@@ -155,8 +206,13 @@ export function registerTuiTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post("/tui/open-themes", undefined, { directory });
+        if (sdk) {
+          await sdk.tui.openThemes();
+        } else {
+          await client.post("/tui/open-themes", undefined, { directory });
+        }
         return toolResult("Theme selector opened.");
       } catch (e) {
         return toolError(e);
