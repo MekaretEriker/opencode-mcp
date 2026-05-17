@@ -1,9 +1,32 @@
+/**
+ * Config tools — get/update project config, list configured providers.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  When `sdkFactory` is
+ * undefined (tests, legacy consumers), the handler falls back to the
+ * legacy `OpenCodeClient.get/patch` methods, which propagate `directory`
+ * per-request via the `{directory}` option.
+ *
+ * All 3 tools mapped to typed SDK methods — no gaps:
+ * - `sdk.config.get({directory})`        → GET /config
+ * - `sdk.config.update({directory,config})` → PATCH /config
+ * - `sdk.config.providers({directory})`  → GET /config/providers
+ */
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
-import { toolJson, toolError, toolResult, redactSecrets, safeStringify, directoryParam } from "../helpers.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
+import { toolJson, toolError, toolResult, redactSecrets, directoryParam } from "../helpers.js";
 
-export function registerConfigTools(server: McpServer, client: OpenCodeClient) {
+export function registerConfigTools(
+  server: McpServer,
+  client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
+) {
   server.tool(
     "opencode_config_get",
     "Get the current opencode configuration",
@@ -11,9 +34,12 @@ export function registerConfigTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const config = await client.get("/config", undefined, directory);
-        const c = redactSecrets(config) as Record<string, unknown>;
+        const raw = sdk
+          ? (await sdk.config.get()).data
+          : await client.get("/config", undefined, directory);
+        const c = redactSecrets(raw) as Record<string, unknown>;
 
         // Build a compact summary instead of dumping entire config
         const lines: string[] = [];
@@ -62,8 +88,12 @@ export function registerConfigTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ config, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        return toolJson(await client.patch("/config", config, directory));
+        const raw = sdk
+          ? (await sdk.config.update({ body: config })).data
+          : await client.patch("/config", config, directory);
+        return toolJson(raw);
       } catch (e) {
         return toolError(e);
       }
@@ -77,8 +107,11 @@ export function registerConfigTools(server: McpServer, client: OpenCodeClient) {
       directory: directoryParam,
     },
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/config/providers", undefined, directory);
+        const raw = sdk
+          ? (await sdk.config.providers()).data
+          : await client.get("/config/providers", undefined, directory);
         const wrapper = raw as Record<string, unknown>;
 
         // API returns { providers: [...], default: { providerId: modelId, ... } }
