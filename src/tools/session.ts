@@ -1,6 +1,48 @@
+/**
+ * Session lifecycle tools — list, create, get, delete, update, fork, share, abort,
+ * revert, summarize, init, todo, status, children, diff, permissions, search.
+ *
+ * Phase C (MEK-297 + MEK-289): migrated to use typed SDK methods via the
+ * optional `sdkFactory` parameter.  Each handler calls
+ * `sdkFactory?.(directory)` to obtain a per-directory SDK client, because
+ * `createCoworkClient` bakes `directory` into the customFetch closure at
+ * construction time (see sdk-adapter.ts:180+222).  A global cache in
+ * `src/index.ts` ensures equivalent directories share a client instance.
+ *
+ * When `sdkFactory` is undefined (tests, legacy consumers), the handler
+ * falls back to the legacy `OpenCodeClient.post/get/delete/patch` methods,
+ * which propagate `directory` per-request via the `{directory}` option.
+ *
+ * All 18 tools mapped to typed SDK methods — two SDK gaps:
+ * - `sdk.session.list()`          → GET  /session
+ * - `sdk.session.create()`        → POST /session
+ * - `sdk.session.get()`           → GET  /session/{id}
+ * - `sdk.session.delete()`        → DELETE /session/{id}
+ * - `sdk.session.update()`        → PATCH /session/{id}
+ * - `sdk.session.children()`      → GET  /session/{id}/children
+ * - `sdk.session.status()`        → GET  /session/status
+ * - `sdk.session.todo()`          → GET  /session/{id}/todo
+ * - `sdk.session.init()`          → POST /session/{id}/init
+ * - `sdk.session.abort()`         → POST /session/{id}/abort
+ * - `sdk.session.fork()`          → POST /session/{id}/fork
+ * - `sdk.session.share()`         → POST /session/{id}/share
+ * - `sdk.session.unshare()`       → DELETE /session/{id}/share
+ * - `sdk.session.diff()`          → GET  /session/{id}/diff
+ * - `sdk.session.summarize()`     → POST /session/{id}/summarize
+ * - `sdk.session.revert()`        → POST /session/{id}/revert
+ * - `sdk.session.unrevert()`      → POST /session/{id}/unrevert
+ * - `sdk.postSessionIdPermissionsPermissionId()` → POST /session/{id}/permissions/{permissionID}
+ *
+ * SDK gaps (kept as raw `client.x()` with fallback):
+ * - GET /permission          — no SDK method for listing pending permission requests
+ *   (https://opencode.ai/docs/sdk.md). Kept as `client.get("/permission")` in
+ *   `permission_list`.
+ */
+
 import { z } from "zod";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { OpenCodeClient } from "../client.js";
+import type { OpencodeClient } from "@opencode-ai/sdk/client";
 import { toolError, formatSessionList, formatDiffResponse, resolveSessionStatus, toolResult, directoryParam, destructive, readOnly } from "../helpers.js";
 
 /** Format a single session object into a compact human-readable summary. */
@@ -40,6 +82,7 @@ function formatSession(raw: unknown): string {
 export function registerSessionTools(
   server: McpServer,
   client: OpenCodeClient,
+  sdkFactory?: (directory?: string) => OpencodeClient,
 ) {
   server.tool(
     "opencode_session_list",
@@ -49,8 +92,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const sessions = (await client.get("/session", undefined, directory)) as Array<Record<string, unknown>>;
+        const sessions = sdk
+          ? (await sdk.session.list()).data as unknown[]
+          : (await client.get("/session", undefined, directory)) as Array<Record<string, unknown>>;
         return toolResult(formatSessionList(sessions));
       } catch (e) {
         return toolError(e);
@@ -67,11 +113,14 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ parentID, title, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, string> = {};
         if (parentID) body.parentID = parentID;
         if (title) body.title = title;
-        const session = await client.post("/session", body, { directory });
+        const session = sdk
+          ? (await sdk.session.create({ body })).data
+          : await client.post("/session", body, { directory });
         return toolResult(`Session created.\n\n${formatSession(session)}`);
       } catch (e) {
         return toolError(e);
@@ -88,8 +137,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const session = await client.get(`/session/${id}`, undefined, directory);
+        const session = sdk
+          ? (await sdk.session.get({ path: { id } })).data
+          : await client.get(`/session/${id}`, undefined, directory);
         return toolResult(formatSession(session));
       } catch (e) {
         return toolError(e);
@@ -106,8 +158,13 @@ export function registerSessionTools(
     },
     destructive,
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.delete(`/session/${id}`, undefined, directory);
+        if (sdk) {
+          await sdk.session.delete({ path: { id } });
+        } else {
+          await client.delete(`/session/${id}`, undefined, directory);
+        }
         return toolResult(`Session ${id} deleted.`);
       } catch (e) {
         return toolError(e);
@@ -124,10 +181,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, title, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, string> = {};
         if (title !== undefined) body.title = title;
-        const updated = await client.patch(`/session/${id}`, body, directory);
+        const updated = sdk
+          ? (await sdk.session.update({ path: { id }, body })).data
+          : await client.patch(`/session/${id}`, body, directory);
         return toolResult(formatSession(updated));
       } catch (e) {
         return toolError(e);
@@ -144,8 +204,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const children = (await client.get(`/session/${id}/children`, undefined, directory)) as unknown[];
+        const children = sdk
+          ? (await sdk.session.children({ path: { id } })).data as unknown[]
+          : (await client.get(`/session/${id}/children`, undefined, directory)) as unknown[];
         if (!children || !Array.isArray(children) || children.length === 0) {
           return toolResult("No child sessions found.");
         }
@@ -164,8 +227,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get("/session/status", undefined, directory);
+        const raw = sdk
+          ? (await sdk.session.status()).data
+          : await client.get("/session/status", undefined, directory);
         const statuses = raw && typeof raw === "object" && !Array.isArray(raw)
           ? raw as Record<string, unknown>
           : {};
@@ -190,8 +256,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const raw = await client.get(`/session/${id}/todo`, undefined, directory);
+        const raw = sdk
+          ? (await sdk.session.todo({ path: { id } })).data
+          : await client.get(`/session/${id}/todo`, undefined, directory);
         const todos = Array.isArray(raw) ? raw as Array<Record<string, unknown>> : [];
         if (todos.length === 0) {
           return toolResult("No todos for this session.");
@@ -223,8 +292,15 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, messageID, providerID, modelID, variant, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post(`/session/${id}/init`, { messageID, providerID, modelID, variant }, { directory });
+        const body: Record<string, string | undefined> = { messageID, providerID, modelID, variant };
+        if (sdk) {
+          // SDK body shape omits `variant` — pass minimal shape to avoid type errors
+          await sdk.session.init({ path: { id }, body: { messageID, providerID, modelID } });
+        } else {
+          await client.post(`/session/${id}/init`, body, { directory });
+        }
         return toolResult("AGENTS.md initialization started.");
       } catch (e) {
         return toolError(e);
@@ -240,8 +316,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post(`/session/${id}/abort`, undefined, { directory });
+        if (sdk) {
+          await sdk.session.abort({ path: { id } });
+        } else {
+          await client.post(`/session/${id}/abort`, undefined, { directory });
+        }
         return toolResult(`Session ${id} aborted.`);
       } catch (e) {
         return toolError(e);
@@ -258,10 +339,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, messageID, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, string> = {};
         if (messageID) body.messageID = messageID;
-        const forked = await client.post(`/session/${id}/fork`, body, { directory });
+        const forked = sdk
+          ? (await sdk.session.fork({ path: { id }, body })).data
+          : await client.post(`/session/${id}/fork`, body, { directory });
         return toolResult(`Session forked.\n\n${formatSession(forked)}`);
       } catch (e) {
         return toolError(e);
@@ -277,8 +361,11 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const result = await client.post(`/session/${id}/share`, undefined, { directory });
+        const result = sdk
+          ? (await sdk.session.share({ path: { id } })).data
+          : await client.post(`/session/${id}/share`, undefined, { directory });
         const r = result as Record<string, unknown>;
         // API may return share URL in different locations
         const shareUrl = r.shareUrl ?? (r.share as Record<string, unknown> | undefined)?.url ?? null;
@@ -298,8 +385,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.delete(`/session/${id}/share`, undefined, directory);
+        if (sdk) {
+          await sdk.session.unshare({ path: { id } });
+        } else {
+          await client.delete(`/session/${id}/share`, undefined, directory);
+        }
         return toolResult(`Session ${id} unshared.`);
       } catch (e) {
         return toolError(e);
@@ -316,10 +408,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, messageID, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const query: Record<string, string> = {};
         if (messageID) query.messageID = messageID;
-        const diffs = await client.get(`/session/${id}/diff`, query, directory);
+        const diffs = sdk
+          ? (await sdk.session.diff({ path: { id }, query: Object.keys(query).length > 0 ? { messageID: query.messageID } : undefined })).data
+          : await client.get(`/session/${id}/diff`, query, directory);
         return toolResult(formatDiffResponse(diffs as unknown[]));
       } catch (e) {
         return toolError(e);
@@ -338,8 +433,14 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, providerID, modelID, variant, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post(`/session/${id}/summarize`, { providerID, modelID, variant }, { directory });
+        if (sdk) {
+          // SDK body shape omits `variant` — pass minimal shape to avoid type errors
+          await sdk.session.summarize({ path: { id }, body: { providerID, modelID } });
+        } else {
+          await client.post(`/session/${id}/summarize`, { providerID, modelID, variant }, { directory });
+        }
         return toolResult("Session summarization started.");
       } catch (e) {
         return toolError(e);
@@ -357,10 +458,15 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, messageID, partID, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         const body: Record<string, string> = { messageID };
         if (partID) body.partID = partID;
-        await client.post(`/session/${id}/revert`, body, { directory });
+        if (sdk) {
+          await sdk.session.revert({ path: { id }, body: body as { messageID: string; partID?: string } });
+        } else {
+          await client.post(`/session/${id}/revert`, body, { directory });
+        }
         return toolResult(`Message ${messageID} reverted.`);
       } catch (e) {
         return toolError(e);
@@ -376,8 +482,13 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        await client.post(`/session/${id}/unrevert`, undefined, { directory });
+        if (sdk) {
+          await sdk.session.unrevert({ path: { id } });
+        } else {
+          await client.post(`/session/${id}/unrevert`, undefined, { directory });
+        }
         return toolResult("All reverted messages restored.");
       } catch (e) {
         return toolError(e);
@@ -394,6 +505,8 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ directory }) => {
+      // SDK gap: no `sdk.session.permission.list()` in @opencode-ai/sdk v1
+      // (https://opencode.ai/docs/sdk.md). Kept as raw client.get("/permission").
       try {
         const requests = (await client.get("/permission", undefined, directory)) as Array<Record<string, unknown>>;
         if (!requests || !Array.isArray(requests) || requests.length === 0) {
@@ -438,14 +551,24 @@ export function registerSessionTools(
       directory: directoryParam,
     },
     async ({ id, permissionID, reply, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
         // Try the new API first (POST /permission/{requestID}/reply)
+        // SDK gap: no `sdk.permission.reply()` method in @opencode-ai/sdk v1
+        // (https://opencode.ai/docs/sdk.md). Kept as raw client.post().
         try {
           await client.post(`/permission/${permissionID}/reply`, { reply }, { directory });
           return toolResult(`Permission ${reply === "reject" ? "rejected" : "approved"} (${reply}).`);
         } catch {
-          // Fall back to the deprecated session-scoped endpoint
-          await client.post(`/session/${id}/permissions/${permissionID}`, { response: reply }, { directory });
+          // Fall back to the session-scoped permission endpoint (SDK or legacy)
+          if (sdk) {
+            await sdk.postSessionIdPermissionsPermissionId({
+              path: { id, permissionID },
+              body: { response: reply },
+            });
+          } else {
+            await client.post(`/session/${id}/permissions/${permissionID}`, { response: reply }, { directory });
+          }
           return toolResult(`Permission ${reply === "reject" ? "rejected" : "approved"} (${reply}).`);
         }
       } catch (e) {
@@ -464,8 +587,11 @@ export function registerSessionTools(
     },
     readOnly,
     async ({ query, directory }) => {
+      const sdk = sdkFactory?.(directory);
       try {
-        const sessions = (await client.get("/session", undefined, directory)) as Array<Record<string, unknown>>;
+        const sessions = sdk
+          ? (await sdk.session.list()).data as Array<Record<string, unknown>>
+          : (await client.get("/session", undefined, directory)) as Array<Record<string, unknown>>;
         if (!sessions || sessions.length === 0) {
           return toolResult("No sessions found.");
         }

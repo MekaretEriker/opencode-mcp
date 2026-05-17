@@ -196,7 +196,7 @@ const server = new McpServer(
 registerGlobalTools(server, client);
 registerConfigTools(server, client);
 registerProjectTools(server, client);
-registerSessionTools(server, client);
+registerSessionTools(server, client, sdkFactory);
 registerMessageTools(server, client, sdkFactory);
 registerFileTools(server, client);
 registerProviderTools(server, client);
