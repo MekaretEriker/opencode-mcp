@@ -62,12 +62,14 @@ to update their dep range.
 
 ## Issue tracking — GitHub Issues + GitHub Projects v2
 
-Issues live on the GitHub repo (`MekaretEriker/opencode-mcp/issues`) and are
-surfaced on the project board (the operator's GitHub Projects v2 instance —
-see `opencode-agent/CLAUDE.md` for the canonical project URL). The repo
-historically tracked work in Linear under the `MEK-XXX` identifier; that
-migration is complete, and historical MEK references in CHANGELOG entries
-and commit history remain unchanged for archive integrity.
+Issues live on the GitHub repo (`MekaretEriker/opencode-mcp/issues`) and roll up
+on the user-level project board:
+**https://github.com/users/MekaretEriker/projects/2**.
+
+The sibling `opencode-agent` repo feeds the same board. Both repos tracked
+work in Linear under `MEK-XXX` identifiers prior to the migration; historical
+references in CHANGELOG entries, skills, and commit history are preserved
+as archive — do not rewrite them.
 
 **New work uses GitHub-native conventions:**
 
