@@ -2005,7 +2005,7 @@ describe("Tool handlers", () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_test" });
-          if (path.includes("/prompt")) return Promise.resolve({});
+          if (path.includes("/message")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {
@@ -2017,7 +2017,7 @@ describe("Tool handlers", () => {
           return Promise.resolve({});
         }),
         subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
-          // First call: POST /session/ses_test/prompt uses /session/ses_test/event
+          // First call: POST /session/ses_test/message uses /session/ses_test/event
           if (path.startsWith("/session/")) {
             yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test", toolName: "read" } }) };
             yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test", toolName: "read" } }) };
@@ -2053,7 +2053,7 @@ describe("Tool handlers", () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_fallback" });
-          if (path.includes("/prompt")) return Promise.resolve({});
+          if (path.includes("/message")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {
@@ -2099,7 +2099,7 @@ describe("Tool handlers", () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_hang" });
-          if (path.includes("/prompt")) return Promise.resolve({});
+          if (path.includes("/message")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockResolvedValue({}),
@@ -2137,7 +2137,7 @@ describe("Tool handlers", () => {
       const mockClient = createMockClient({
         post: vi.fn().mockImplementation((path: string) => {
           if (path === "/session") return Promise.resolve({ id: "ses_test" });
-          if (path.includes("/prompt")) return Promise.resolve({});
+          if (path.includes("/message")) return Promise.resolve({});
           return Promise.resolve({});
         }),
         get: vi.fn().mockImplementation((path: string) => {

@@ -807,7 +807,10 @@ export function registerWorkflowTools(
           sid = session.id as string;
         }
 
-        // 2. Send prompt via canonical /prompt endpoint
+        // 2. Send prompt via /message endpoint
+        // NOTE: MEK-294 — /session/{sid}/prompt is accepted by opencode 1.14.50
+        // but does NOT trigger LLM execution. /message is the canonical endpoint
+        // that actually starts the agent (same one used by opencode_run, etc.).
         const body: Record<string, unknown> = {
           parts: [{ type: "text", text: prompt }],
         };
@@ -815,7 +818,7 @@ export function registerWorkflowTools(
         if (model) body.model = model;
         if (agent) body.agent = agent;
 
-        await client.post(`/session/${sid}/prompt`, body, { directory });
+        await client.post(`/session/${sid}/message`, body, { directory });
 
         // 3. Subscribe SSE
         const maxMs = (maxDurationSeconds ?? 600) * 1000;
