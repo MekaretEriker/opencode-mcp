@@ -9,6 +9,37 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.11.2-mekareteriker.0] - 2026-05-17
+
+### Fixed
+
+- `[fork]` **MEK-295 — Hotfix `opencode_run_streaming` SSE ordering + endpoint canonique async.**
+  v1.11.1 (MEK-294) avait corrigé le bug d'endpoint en switchant `/prompt` → `/message`, mais
+  `/message` est **synchrone** (bloque jusqu'à fin de l'agent loop) — donc dans
+  `workflow.ts` la subscription SSE après le `await client.post(...)` se faisait
+  systématiquement APRÈS l'émission de `session.idle`. Résultat : le LLM exécutait, la
+  session générait un assistant message non-vide, mais le tool retournait `SESSION_HANG`
+  après `maxDurationSeconds`. Reproduit en live le 2026-05-17 (session
+  `ses_1c9e6dbe9ffexqep0ApCY1RUCl` : Δ Created → Updated = 2.57s mais SESSION_HANG après 60s).
+  - Fix endpoint : `POST /session/{sid}/message` → `POST /session/{sid}/prompt_async`.
+    C'est l'endpoint canonique async sur opencode 1.14.50 — il retourne 204 immédiatement
+    et émet les SSE events pour progression + completion. Documenté dans la doc SDK
+    officielle et déjà utilisé par `opencode_message_send_async` dans le même repo
+    (l'incohérence était uniquement dans `workflow.ts`).
+  - Fix ordering : la subscription SSE (`/event` global) est maintenant **ouverte avant**
+    le POST. Le pattern reproduit ce que fait le SDK officiel via `client.event.subscribe()` :
+    fetch en vol → POST → consume events filtrés par `sessionID`. Le per-session
+    `/session/{sid}/event` (pas dans le SDK, source de bugs first-event-loss historiques —
+    cf. commit 53aa725) est retiré.
+  - Tests : nouveau test d'ordering (`MEK-295 ordering guard`) qui asserte que
+    `subscribeSSE` est appelé avant `post:/prompt_async` — catch toute régression future.
+    Test "fallback to /event when /session/{id}/event returns HTML" supprimé (n'a plus
+    de sens, on n'utilise plus le per-session). 346 passed, 5 skipped baseline préservé.
+  - **Règle de process** : nouvelle section "Source of truth — opencode SDK first, Hermes
+    reference second" ajoutée à `AGENTS.md`. Avant toute nouvelle route HTTP ou pattern
+    SSE, on consulte le SDK `@opencode-ai/sdk` + l'écosystème Hermes. Plus jamais
+    d'invention d'endpoint depuis la training data.
+
 ## [1.11.1-mekareteriker.0] - 2026-05-17
 
 ### Fixed
