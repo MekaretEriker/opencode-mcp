@@ -27,21 +27,17 @@ export function registerEventTools(
         .describe("Maximum number of events to collect (default: 50)"),
       directory: directoryParam,
     },
-    async ({ durationMs, maxEvents, directory: _directory }) => {
+    async ({ durationMs, maxEvents, directory }) => {
       try {
         const duration = Math.min(durationMs ?? 3000, 30000);
         const max = maxEvents ?? 50;
         const events: Array<{ event: string; data: string }> = [];
 
-        // Note: SSE subscribeSSE does not currently support the directory
-        // header. The event stream is server-wide. The directory param is
-        // accepted for API consistency but not forwarded to SSE.
-
         const controller = new AbortController();
         const timeout = setTimeout(() => controller.abort(), duration);
 
         try {
-          for await (const evt of client.subscribeSSE("/event", { signal: controller.signal })) {
+          for await (const evt of client.subscribeSSE("/event", { signal: controller.signal, directory })) {
             events.push(evt);
             if (events.length >= max) break;
             if (controller.signal.aborted) break;

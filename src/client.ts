@@ -423,13 +423,13 @@ export class OpenCodeClient {
    */
   async *subscribeSSE(
     path: string,
-    opts?: { signal?: AbortSignal },
+    opts?: { signal?: AbortSignal; directory?: string },
   ): AsyncGenerator<{ event: string; data: string }, void, undefined> {
     const url = this.buildUrl(path);
     const res = await fetch(url, {
       method: "GET",
       headers: {
-        ...this.headers("text/event-stream"),
+        ...this.headers("text/event-stream", opts?.directory),
         Accept: "text/event-stream",
         "Cache-Control": "no-cache",
       },

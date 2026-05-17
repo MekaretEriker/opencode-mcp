@@ -58,7 +58,7 @@ describe("Tool registration", () => {
   });
 
   describe("registerWorkflowTools", () => {
-    it("registers all 13 workflow tools", () => {
+    it("registers all 14 workflow tools", () => {
       const { tools } = captureTools(registerWorkflowTools);
       const expected = [
         "opencode_setup",
@@ -69,6 +69,7 @@ describe("Tool registration", () => {
         "opencode_context",
         "opencode_wait",
         "opencode_run",
+        "opencode_run_streaming",
         "opencode_fire",
         "opencode_check",
         "opencode_review_changes",
@@ -78,7 +79,7 @@ describe("Tool registration", () => {
       for (const name of expected) {
         expect(tools.has(name), `Missing tool: ${name}`).toBe(true);
       }
-      expect(tools.size).toBe(13);
+      expect(tools.size).toBe(14);
     });
   });
 
@@ -1996,6 +1997,187 @@ describe("Tool handlers", () => {
       const sessionCreateCalls = postMock.mock.calls.filter((c: unknown[]) => c[0] === "/session");
       expect(sessionCreateCalls.length).toBe(0);
       expect(result.content[0].text).toContain("ses-existing");
+    });
+  });
+
+  describe("opencode_run_streaming", () => {
+    it("handles happy path: tool.start → tool.end → session.idle", async () => {
+      const mockClient = createMockClient({
+        post: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session") return Promise.resolve({ id: "ses_test" });
+          if (path.includes("/prompt")) return Promise.resolve({});
+          return Promise.resolve({});
+        }),
+        get: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session/ses_test") return Promise.resolve({ id: "ses_test", cost: 0.05 });
+          if (path.includes("/message")) return Promise.resolve([
+            { info: { role: "user", id: "m1" }, parts: [{ type: "text", text: "Build a feature" }] },
+            { info: { role: "assistant", id: "m2" }, parts: [{ type: "text", text: "Feature built!" }] },
+          ]);
+          return Promise.resolve({});
+        }),
+        subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
+          // First call: POST /session/ses_test/prompt uses /session/ses_test/event
+          if (path.startsWith("/session/")) {
+            yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test", toolName: "read" } }) };
+            yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test", toolName: "read" } }) };
+            yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_test" } }) };
+            return;
+          }
+          // Second call (restart after probe — actually never reached because first stream succeeds)
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test", toolName: "read" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test", toolName: "read" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_test" } }) };
+        }),
+      });
+      const tools = new Map<string, Function>();
+      const mockServer = {
+        tool: vi.fn((...args: unknown[]) => {
+          tools.set(args[0] as string, args[args.length - 1] as Function);
+        }),
+      } as unknown as McpServer;
+      registerWorkflowTools(mockServer, mockClient);
+
+      const handler = tools.get("opencode_run_streaming")!;
+      const result = await handler({ prompt: "Build a feature" });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text;
+      expect(text).toContain("Session: ses_test");
+      expect(text).toContain("Events received: 3");
+      expect(text).toContain("Cost: $0.05");
+      expect(text).toContain("Feature built!");
+    });
+
+    it("falls back to /event when /session/{id}/event returns HTML", async () => {
+      let eventCalls = 0;
+      const mockClient = createMockClient({
+        post: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session") return Promise.resolve({ id: "ses_fallback" });
+          if (path.includes("/prompt")) return Promise.resolve({});
+          return Promise.resolve({});
+        }),
+        get: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session/ses_fallback") return Promise.resolve({ id: "ses_fallback", cost: 0 });
+          if (path.includes("/message")) return Promise.resolve([
+            { info: { role: "assistant", id: "m1" }, parts: [{ type: "text", text: "Done" }] },
+          ]);
+          return Promise.resolve({});
+        }),
+        subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
+          eventCalls++;
+          if (path.startsWith("/session/") && eventCalls === 1) {
+            // First call: per-session SSE, simulate parsing error (HTML body)
+            // We can only simulate by yielding invalid JSON in data
+            yield { event: "message", data: "<html><body>SPA fallback</body></html>" };
+            return;
+          }
+          // /event fallback with filtering
+          // session.updated events come with properties.sessionID
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.updated", properties: { sessionID: "ses_other" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_fallback" } }) };
+        }),
+      });
+      const tools = new Map<string, Function>();
+      const mockServer = {
+        tool: vi.fn((...args: unknown[]) => {
+          tools.set(args[0] as string, args[args.length - 1] as Function);
+        }),
+      } as unknown as McpServer;
+      registerWorkflowTools(mockServer, mockClient);
+
+      const handler = tools.get("opencode_run_streaming")!;
+      const result = await handler({ prompt: "Do something" });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text;
+      expect(text).toContain("ses_fallback");
+      // Should have fallen back to /event, only ses_fallback events counted
+      expect(text).toContain("Events received: 1");
+      expect(text).toContain("1x session.idle");
+    });
+
+    it("returns SESSION_HANG via toolError on timeout", async () => {
+      const mockClient = createMockClient({
+        post: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session") return Promise.resolve({ id: "ses_hang" });
+          if (path.includes("/prompt")) return Promise.resolve({});
+          return Promise.resolve({});
+        }),
+        get: vi.fn().mockResolvedValue({}),
+        subscribeSSE: vi.fn().mockImplementation(async function* (_path: string, opts?: { signal?: AbortSignal }) {
+          yield { event: "session.updated", data: JSON.stringify({ type: "something.else", properties: { sessionID: "ses_hang" } }) };
+          // Wait for abort signal
+          if (opts?.signal) {
+            const signal = opts.signal;
+            await new Promise<void>((resolve) => {
+              if (signal.aborted) resolve();
+              else signal.addEventListener("abort", () => resolve(), { once: true });
+            });
+          }
+          return;
+        }),
+      });
+      const tools = new Map<string, Function>();
+      const mockServer = {
+        tool: vi.fn((...args: unknown[]) => {
+          tools.set(args[0] as string, args[args.length - 1] as Function);
+        }),
+      } as unknown as McpServer;
+      registerWorkflowTools(mockServer, mockClient);
+
+      const handler = tools.get("opencode_run_streaming")!;
+      const result = await handler({ prompt: "Slow task", maxDurationSeconds: 1 });
+      expect(result.isError).toBe(true);
+      const text = result.content[0].text;
+      // Should contain structured error with SESSION_HANG + sessionId
+      expect(text).toContain("SESSION_HANG");
+      expect(text).toContain("ses_hang");
+    });
+
+    it("filters out events from other sessions on global /event", async () => {
+      const mockClient = createMockClient({
+        post: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session") return Promise.resolve({ id: "ses_test" });
+          if (path.includes("/prompt")) return Promise.resolve({});
+          return Promise.resolve({});
+        }),
+        get: vi.fn().mockImplementation((path: string) => {
+          if (path === "/session/ses_test") return Promise.resolve({ id: "ses_test", cost: 0.01 });
+          if (path.includes("/message")) return Promise.resolve([
+            { info: { role: "assistant", id: "m1" }, parts: [{ type: "text", text: "Result" }] },
+          ]);
+          return Promise.resolve({});
+        }),
+        subscribeSSE: vi.fn().mockImplementation(async function* (path: string) {
+          if (path.startsWith("/session/")) {
+            // Per-session probe: throw by yielding invalid HTML-like data
+            yield { event: "message", data: "SPA-FALLBACK" };
+            return;
+          }
+          // /event global — mix of sessions
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_other" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_test" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.end", properties: { sessionID: "ses_test" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "tool.start", properties: { sessionID: "ses_other" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_other" } }) };
+          yield { event: "session.updated", data: JSON.stringify({ type: "session.idle", properties: { sessionID: "ses_test" } }) };
+        }),
+      });
+      const tools = new Map<string, Function>();
+      const mockServer = {
+        tool: vi.fn((...args: unknown[]) => {
+          tools.set(args[0] as string, args[args.length - 1] as Function);
+        }),
+      } as unknown as McpServer;
+      registerWorkflowTools(mockServer, mockClient);
+
+      const handler = tools.get("opencode_run_streaming")!;
+      const result = await handler({ prompt: "Task" });
+      expect(result.isError).toBeFalsy();
+      const text = result.content[0].text;
+      expect(text).toContain("ses_test");
+      // Should only count ses_test events: 1 tool.start + 1 tool.end + 1 session.idle = 3
+      // The ses_other events are filtered out, so:
+      expect(text).toContain("Events received: 3");
     });
   });
 

@@ -775,6 +775,165 @@ export function registerWorkflowTools(
     },
   );
 
+  // ─── Run streaming: SSE-backed version of run (MEK-283) ───────────
+  server.tool(
+    "opencode_run_streaming",
+    "Like opencode_run but uses SSE events instead of polling. Emits MCP progress notifications if the client passed a progressToken. Returns when session.idle fires + status confirmation.",
+    {
+      prompt: z.string().describe("The task or instruction to send"),
+      sessionId: z
+        .string()
+        .optional()
+        .describe("Existing session ID to continue (omit to create a new session)"),
+      title: z.string().optional().describe("Session title (only for new sessions)"),
+      providerID: z.string().optional().describe("Provider ID (e.g. 'anthropic')"),
+      modelID: z.string().optional().describe("Model ID (e.g. 'claude-opus-4-6')"),
+      variant: z.string().optional().describe("Model variant"),
+      agent: z.string().optional().describe("Agent to use"),
+      maxDurationSeconds: z
+        .number()
+        .optional()
+        .describe("Max seconds to wait for completion (default: 600 = 10 minutes)"),
+      directory: directoryParam,
+    },
+    async ({ prompt, sessionId, title, providerID, modelID, variant, agent, maxDurationSeconds, directory }, extra) => {
+      let sid = sessionId;
+      try {
+        // 1. Create or reuse session
+        if (!sid) {
+          const session = (await client.post("/session", {
+            title: title ?? prompt.slice(0, 80),
+          }, { directory })) as Record<string, unknown>;
+          sid = session.id as string;
+        }
+
+        // 2. Send prompt via canonical /prompt endpoint
+        const body: Record<string, unknown> = {
+          parts: [{ type: "text", text: prompt }],
+        };
+        const model = applyModelDefaults(providerID, modelID, variant);
+        if (model) body.model = model;
+        if (agent) body.agent = agent;
+
+        await client.post(`/session/${sid}/prompt`, body, { directory });
+
+        // 3. Subscribe SSE
+        const maxMs = (maxDurationSeconds ?? 600) * 1000;
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), maxMs);
+
+        // MCP progress token if client provided one
+        const progressToken = (extra as any)?._meta?.progressToken;
+        const sendNotify = progressToken
+          ? (msg: string, progress: number) => {
+              try { (extra as any)?.sendNotification?.({
+                method: "notifications/progress",
+                params: { progressToken, progress, message: msg },
+              }); } catch { /* best-effort */ }
+            }
+          : () => {};
+
+        let eventCount = 0;
+        const eventCounts: Record<string, number> = {};
+        let sawIdle = false;
+
+        const processEvent = (parsed: any) => {
+          eventCount++;
+          eventCounts[parsed.type] = (eventCounts[parsed.type] ?? 0) + 1;
+          sendNotify(`event: ${parsed.type}`, eventCount);
+          if (parsed.type === "session.idle") {
+            sawIdle = true;
+            return true;
+          }
+          return false;
+        };
+
+        try {
+          // Try per-session SSE first; fall back to global /event
+          let streamPath = `/session/${sid}/event`;
+          let iter: AsyncIterator<{ event: string; data: string }, void, undefined>;
+          let firstEvent: { evt: { event: string; data: string }; parsed: any } | null = null;
+          try {
+            const stream = client.subscribeSSE(streamPath, { signal: controller.signal, directory });
+            iter = stream[Symbol.asyncIterator]();
+            // Probe first event with 500ms timeout — keep iterator alive on success
+            const firstEventP = (async () => {
+              const result = await iter.next();
+              if (result.done) return { kind: "stream-ended" as const };
+              const evt = result.value;
+              const parsed = JSON.parse(evt.data);
+              return { kind: "event" as const, evt, parsed };
+            })();
+            const timeoutP = new Promise<{ kind: "timeout" }>((res) =>
+              setTimeout(() => res({ kind: "timeout" }), 500),
+            );
+            const probe = await Promise.race([firstEventP, timeoutP]);
+            if (probe.kind !== "event") {
+              controller.abort();
+              throw new Error("Per-session SSE not available");
+            }
+            firstEvent = { evt: probe.evt, parsed: probe.parsed };
+          } catch {
+            streamPath = "/event";
+            iter = client.subscribeSSE(streamPath, { signal: controller.signal, directory })[Symbol.asyncIterator]();
+          }
+
+          // Process firstEvent from probe if available, then continue on same iterator
+          if (firstEvent) {
+            if (processEvent(firstEvent.parsed)) {
+              sawIdle = true;
+            }
+          }
+
+          if (!sawIdle) {
+            while (true) {
+              const { done, value: evt } = await iter.next();
+              if (done) break;
+
+              let parsed: any;
+              try { parsed = JSON.parse(evt.data); } catch { continue; }
+
+              // Filter by sessionID when on global /event
+              const evtSid = parsed.properties?.sessionID;
+              if (streamPath === "/event" && evtSid && evtSid !== sid) continue;
+
+              if (processEvent(parsed)) break;
+            }
+          }
+        } catch {
+          // SSE aborted (timeout) or stream error — handled below
+        } finally {
+          clearTimeout(timeout);
+        }
+
+        // 4. If timeout without idle, return SESSION_HANG
+        if (!sawIdle) {
+          return toolError(
+            new Error(`Session ${sid} did not emit session.idle within ${maxDurationSeconds ?? 600}s`),
+            { providerID, modelID, sessionId: sid },
+          );
+        }
+
+        // 5. Double-check status (issue #3815: idle not deterministic)
+        const finalSession = (await client.get(`/session/${sid}`, undefined, directory)) as Record<string, unknown>;
+
+        // 6. Fetch final messages summary
+        const messages = (await client.get(`/session/${sid}/message`, undefined, directory)) as unknown[];
+        const formatted = formatMessageList(messages);
+        const eventSummary = Object.entries(eventCounts)
+          .map(([t, n]) => `${n}x ${t}`)
+          .join(", ");
+
+        const dirLabel = directory ? `Directory: ${directory}` : "Directory: (server default)";
+        return toolResult(
+          `${dirLabel}\nSession: ${sid}\nEvents received: ${eventCount} (${eventSummary})\nCost: $${finalSession.cost ?? 0}\n\n${formatted}`,
+        );
+      } catch (e) {
+        return toolError(e, { providerID, modelID, sessionId: sid });
+      }
+    },
+  );
+
   // ─── Fire: send task and return immediately ────────────────────────
   server.tool(
     "opencode_fire",

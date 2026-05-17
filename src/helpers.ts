@@ -745,6 +745,8 @@ export function buildStructuredError(e: unknown, ctx?: ErrorContext): Structured
     else if (e.status === 429) code = "RATE_LIMITED";
     else if (e.status >= 500) code = "PROVIDER_ERROR";
     else code = "PROVIDER_ERROR";
+  } else if (lower.includes("did not emit session.idle") || lower.includes("session.idle within")) {
+    code = "SESSION_HANG";
   } else if (
     lower.includes("timeout") ||
     lower.includes("timed out") ||
