@@ -195,7 +195,7 @@ const server = new McpServer(
 // ── Low-level API tools ─────────────────────────────────────────────
 registerGlobalTools(server, client);
 registerConfigTools(server, client);
-registerProjectTools(server, client);
+registerProjectTools(server, client, sdkFactory);
 registerSessionTools(server, client, sdkFactory);
 registerMessageTools(server, client, sdkFactory);
 registerFileTools(server, client, sdkFactory);
