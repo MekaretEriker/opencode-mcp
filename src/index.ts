@@ -209,7 +209,7 @@ registerWorkflowTools(server, client, sdkFactory);
 registerTuiTools(server, client, sdkFactory);
 
 // ── Event streaming ─────────────────────────────────────────────────
-registerEventTools(server, client);
+registerEventTools(server, client, sdkFactory);
 
 // ── Resources ───────────────────────────────────────────────────────
 registerResources(server, client);
