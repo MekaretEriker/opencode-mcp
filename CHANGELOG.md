@@ -9,6 +9,38 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [Unreleased]
+
+### Added
+
+- `[fork]` **MEK-296 — SDK adapter layer (Phase B: foundation).**
+  Installed `@opencode-ai/sdk@1.15.3` (auto-generated from opencode server OpenAPI spec,
+  type-safe client). Created `src/sdk-adapter.ts` with `createCoworkClient(opts)` factory
+  that wraps the official SDK client with Cowork-specific extensions: `x-opencode-directory`
+  header injection via `normalizeDirectory()` (MEK-289), idempotency dedup for POST/PUT/PATCH
+  (MEK-284), retry policy with method/path-aware fast-fail (MEK-281), lazy server
+  reconnection (MEK-280), and structured `OpenCodeError` classification (MEK-282).
+  Created `src/types.ts` re-exporting the most-used SDK types (`Session`, `Message`,
+  `Part`, `Agent`, `Project`, `Config`, etc.) for Phase C consumption. Neither
+  `OpenCodeClient` nor any existing tool was modified — baseline test suite preserved
+  plus 17 new sdk-adapter tests (final: 363 passed, 5 skipped, 0 failed).
+
+  **Dedup design fix during implementation review.** The first draft of the
+  idempotency layer stored a single `Promise<Response>` in the cache and returned it
+  directly to both the original and the deduped callers. Both callers shared the same
+  `Response` instance, so the second caller's body read failed with
+  *"Body is unusable: Body has already been read"*. Initial diagnostic blamed
+  `node:undici` and the SDK's internal request handling, and proposed dropping three
+  multi-POST idempotency tests as a workaround. Re-investigation reproduced the bug
+  in a minimal probe (`fetch called 1 time, result 2 rejected with Body is unusable`),
+  isolating the cause to `Response`-body-consumed-twice rather than any SDK bug.
+  Fix: clone the cached `Response` on every return (`existing.promise.then((r) => r.clone())`
+  on dedup hit, and `promise.then((r) => r.clone())` for the first caller so the
+  in-cache `Response` stays pristine for subsequent dedupped callers). The three
+  multi-POST tests are restored and pass. This validates the broader MEK-294/295
+  lesson: when a symptom points at an external bug, reproduce it in isolation
+  before accepting the workaround. See AGENTS.md "Source of truth" for the rule.
+
 ## [1.11.2-mekareteriker.0] - 2026-05-17
 
 ### Fixed

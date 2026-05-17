@@ -1,7 +1,7 @@
 {
   "name": "@mekareteriker/opencode-mcp",
   "version": "1.11.2-mekareteriker.0",
-  "description": "Hardened fork of opencode-mcp \u2014 Windows-compatible directory validation, structured errors, idempotency. Drop-in replacement for the upstream package.",
+  "description": "Hardened fork of opencode-mcp — Windows-compatible directory validation, structured errors, idempotency. Drop-in replacement for the upstream package.",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -58,7 +58,8 @@
     "access": "public"
   },
   "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.12.1"
+    "@modelcontextprotocol/sdk": "^1.12.1",
+    "@opencode-ai/sdk": "^1.15.3"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
