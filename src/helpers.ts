@@ -665,7 +665,56 @@ export type StructuredErrorCode =
   | "AUTH_FAILED"
   | "RATE_LIMITED"
   | "INVALID_DIRECTORY"
+  | "SHELL_CONTENT_REFUSED"
   | "UNKNOWN";
+
+/**
+ * Typed error thrown by `opencode_shell_execute` (and future similar tools)
+ * when the wrapper refuses a command for content-discipline reasons —
+ * currently: unescaped backticks (issue #25, file-first content discipline).
+ *
+ * The refusal is **deterministic** (the wrapper rejects before any LLM call),
+ * so downstream skills like `opencode-fallback-chain` should NOT retry on a
+ * different provider — retrying yields the same refusal.
+ *
+ * Carries `SHELL_CONTENT_REFUSED` through `buildStructuredError()` via an
+ * `instanceof` check that runs before any HTTP-status / message-pattern
+ * classification.  Issue #28.
+ */
+export class ShellContentRefusedError extends Error {
+  readonly code = "SHELL_CONTENT_REFUSED" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "ShellContentRefusedError";
+  }
+}
+
+/**
+ * Typed error thrown by `opencode_run` / `opencode_run_streaming` /
+ * `opencode_ask` / `opencode_reply` / `opencode_message_send` when the
+ * assistant message that terminates the session contains no text content
+ * (parts array empty, all text parts blank, or response object missing
+ * entirely).  Detected via `analyzeMessageResponse()` (`isEmpty === true`).
+ *
+ * Issue #26 — before this typed error existed, the wrapper would treat
+ * "session reached idle" as success regardless of whether the assistant
+ * produced any output.  Out-of-roster OpenRouter dispatches (see
+ * `opencode-agent`'s `OPENROUTER-MODELS.md`) silently returned `(no response
+ * text)` with no error surfaced and no fallback chain triggered.
+ *
+ * Carries `EMPTY_RESPONSE` through `buildStructuredError()` via an
+ * `instanceof` check.  This is a stable surface for the
+ * `opencode-fallback-chain` skill, which already maps `EMPTY_RESPONSE` to
+ * "trigger fallback (degenerate model output)" — see opencode-agent v1.1.0
+ * CHANGELOG entry.
+ */
+export class EmptyResponseError extends Error {
+  readonly code = "EMPTY_RESPONSE" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "EmptyResponseError";
+  }
+}
 
 export interface StructuredError {
   code: StructuredErrorCode;
@@ -709,6 +758,8 @@ function getSuggestedAction(code: StructuredErrorCode, message?: string): string
       return "Pass an absolute path to an existing directory.";
     case "SESSION_HANG":
       return "Try opencode_session_abort then retry.";
+    case "SHELL_CONTENT_REFUSED":
+      return "Wrapper-level discipline refusal — do NOT retry on a different provider, the outcome is deterministic. Rewrite the command using the file-first pattern: write the content to a file via your client's Write tool, then reference it with --body-file / --notes-file / -F body=@file / < file. See https://github.com/MekaretEriker/opencode-mcp/issues/25.";
     default:
       return diagnoseUnknownSuggestion(message);
   }
@@ -740,7 +791,15 @@ export function buildStructuredError(e: unknown, ctx?: ErrorContext): Structured
   const lower = message.toLowerCase();
   let code: StructuredErrorCode;
 
-  if (e instanceof OpenCodeError) {
+  // Typed-error fast paths (checked before HTTP-status / message-pattern
+  // classification per AGENTS.md — "Add a classification branch BEFORE the
+  // generic TIMEOUT branch", here promoted to first position because typed
+  // errors are unambiguous).  Issues #28, #26.
+  if (e instanceof ShellContentRefusedError) {
+    code = "SHELL_CONTENT_REFUSED";
+  } else if (e instanceof EmptyResponseError) {
+    code = "EMPTY_RESPONSE";
+  } else if (e instanceof OpenCodeError) {
     if (e.status === 401 || e.status === 403) code = "AUTH_FAILED";
     else if (e.status === 429) code = "RATE_LIMITED";
     else if (e.status >= 500) code = "PROVIDER_ERROR";

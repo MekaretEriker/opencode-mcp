@@ -33,6 +33,8 @@ import {
   formatMessageList,
   applyModelDefaults,
   directoryParam,
+  ShellContentRefusedError,
+  EmptyResponseError,
 } from "../helpers.js";
 
 export function registerMessageTools(
@@ -150,6 +152,19 @@ export function registerMessageTools(
             );
 
         const analysis = analyzeMessageResponse(response);
+
+        // Empty response → EMPTY_RESPONSE structured error (issue #26).
+        if (analysis.isEmpty) {
+          const respParts = (response as { parts?: unknown[] } | null | undefined)?.parts;
+          const ctx: { providerID?: string; modelID?: string; sessionId?: string; responseParts?: unknown[] } = {
+            providerID,
+            modelID,
+            sessionId,
+          };
+          if (Array.isArray(respParts)) ctx.responseParts = respParts;
+          return toolError(new EmptyResponseError(analysis.warning ?? "The AI returned a response with no text content."), ctx);
+        }
+
         const formatted = formatMessageResponse(response);
         const parts: string[] = [];
         if (formatted) parts.push(formatted);
@@ -290,8 +305,13 @@ export function registerMessageTools(
         // #25 — file-first content discipline. Unescaped backticks trigger
         // command substitution and corrupt embedded content. Refuse and
         // teach the alternative.
+        //
+        // #28 — throw a typed ShellContentRefusedError so buildStructuredError
+        // surfaces this as code: SHELL_CONTENT_REFUSED (not UNKNOWN), which
+        // lets downstream skills like opencode-fallback-chain skip the retry
+        // (the refusal is deterministic — no provider switch will help).
         if (/(?<!\\)`/.test(command)) {
-          throw new Error(
+          throw new ShellContentRefusedError(
             "Unescaped backtick in shell command. Backticks trigger command " +
             "substitution and corrupt embedded content. Write content to a " +
             "file via your client's Write tool, then reference it with " +

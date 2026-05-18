@@ -254,7 +254,7 @@ describe("Tool handlers", () => {
       expect(result.content[0].text).toContain("Server down");
     });
 
-    it("warns when response is empty (auth issue)", async () => {
+    it("surfaces EMPTY_RESPONSE when response is empty/null (issue #26)", async () => {
       const emptyClient = createMockClient({
         post: vi.fn()
           .mockResolvedValueOnce({ id: "session-2" }) // create session
@@ -269,11 +269,16 @@ describe("Tool handlers", () => {
       registerWorkflowTools(mockServer, emptyClient);
       const askHandler = tools.get("opencode_ask")!;
       const result = await askHandler({ prompt: "test" });
-      expect(result.content[0].text).toContain("WARNING");
-      expect(result.content[0].text).toContain("empty response");
+      // Pre-#26 behaviour was toolResult with "--- WARNING ---" appended,
+      // letting the caller mistake the empty response for success.  Post-#26
+      // we surface a structured EMPTY_RESPONSE error so downstream skills
+      // like opencode-fallback-chain can route the failure.
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error [EMPTY_RESPONSE]");
+      expect(result.content[0].text).toContain('"code": "EMPTY_RESPONSE"');
     });
 
-    it("warns when response has no text content", async () => {
+    it("surfaces EMPTY_RESPONSE when response has no text content (issue #26)", async () => {
       const noTextClient = createMockClient({
         post: vi.fn()
           .mockResolvedValueOnce({ id: "session-3" })
@@ -288,19 +293,21 @@ describe("Tool handlers", () => {
       registerWorkflowTools(mockServer, noTextClient);
       const askHandler = tools.get("opencode_ask")!;
       const result = await askHandler({ prompt: "test" });
-      expect(result.content[0].text).toContain("WARNING");
-      expect(result.content[0].text).toContain("no text content");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error [EMPTY_RESPONSE]");
+      expect(result.content[0].text).toContain('"code": "EMPTY_RESPONSE"');
     });
 
     it("does not warn for valid response", async () => {
-      // already tested above, but explicitly verify no WARNING
+      // already tested above, but explicitly verify no WARNING and no error
       const result = await handler({ prompt: "What is this project?" });
+      expect(result.isError).toBeFalsy();
       expect(result.content[0].text).not.toContain("WARNING");
     });
   });
 
   describe("opencode_reply", () => {
-    it("warns when reply response is empty", async () => {
+    it("surfaces EMPTY_RESPONSE when reply response is empty (issue #26)", async () => {
       const emptyClient = createMockClient({
         post: vi.fn().mockResolvedValueOnce(null), // empty response
       });
@@ -313,8 +320,9 @@ describe("Tool handlers", () => {
       registerWorkflowTools(mockServer, emptyClient);
       const handler = tools.get("opencode_reply")!;
       const result = await handler({ sessionId: "s1", prompt: "follow up" });
-      expect(result.content[0].text).toContain("WARNING");
-      expect(result.content[0].text).toContain("empty response");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error [EMPTY_RESPONSE]");
+      expect(result.content[0].text).toContain('"code": "EMPTY_RESPONSE"');
     });
 
     it("does not warn for valid reply", async () => {
@@ -1100,7 +1108,7 @@ describe("Tool handlers", () => {
   });
 
   describe("opencode_message_send (R5-B1 fix)", () => {
-    it("warns when response is empty (null)", async () => {
+    it("surfaces EMPTY_RESPONSE when response is empty/null (issue #26)", async () => {
       const mockClient = createMockClient({
         post: vi.fn().mockResolvedValueOnce(null),
       });
@@ -1114,11 +1122,12 @@ describe("Tool handlers", () => {
 
       const handler = tools.get("opencode_message_send")!;
       const result = await handler({ sessionId: "s1", text: "hello" });
-      expect(result.content[0].text).toContain("WARNING");
-      expect(result.content[0].text).toContain("empty response");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error [EMPTY_RESPONSE]");
+      expect(result.content[0].text).toContain('"code": "EMPTY_RESPONSE"');
     });
 
-    it("warns when response has no text content", async () => {
+    it("surfaces EMPTY_RESPONSE when response has no text content (issue #26)", async () => {
       const mockClient = createMockClient({
         post: vi.fn().mockResolvedValueOnce({ parts: [] }),
       });
@@ -1132,8 +1141,9 @@ describe("Tool handlers", () => {
 
       const handler = tools.get("opencode_message_send")!;
       const result = await handler({ sessionId: "s1", text: "hello" });
-      expect(result.content[0].text).toContain("WARNING");
-      expect(result.content[0].text).toContain("no text content");
+      expect(result.isError).toBe(true);
+      expect(result.content[0].text).toContain("Error [EMPTY_RESPONSE]");
+      expect(result.content[0].text).toContain('"code": "EMPTY_RESPONSE"');
     });
 
     it("does not warn for valid response with text", async () => {
@@ -2465,6 +2475,7 @@ describe("Tool handlers", () => {
       const { tools, client } = setupTools();
       const handler = tools.get("opencode_check")!;
       const result = await handler({
+        sessionId: "test-session-id",
         sessionId: "test-session-id",
         directory: "/no/such/directory",
       });

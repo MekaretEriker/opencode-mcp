@@ -38,6 +38,7 @@ import {
   toolError,
   directoryParam,
   readOnly,
+  EmptyResponseError,
 } from "../helpers.js";
 
 export function registerWorkflowTools(
@@ -304,6 +305,22 @@ export function registerWorkflowTools(
         // 3. Analyze for auth / empty response issues
         const analysis = analyzeMessageResponse(response);
 
+        // 3b. Empty response → typed error → buildStructuredError surfaces
+        // it as code: EMPTY_RESPONSE so opencode-fallback-chain can route the
+        // failure correctly.  Issue #26.  Throwing routes through the catch
+        // block below, which already builds the ctx with responseParts for
+        // tokenUsage extraction.
+        if (analysis.isEmpty) {
+          const parts = (response as { parts?: unknown[] } | null | undefined)?.parts;
+          const ctx: { providerID?: string; modelID?: string; sessionId?: string; responseParts?: unknown[] } = {
+            providerID,
+            modelID,
+          };
+          if (sessionId) ctx.sessionId = sessionId;
+          if (Array.isArray(parts)) ctx.responseParts = parts;
+          return toolError(new EmptyResponseError(analysis.warning ?? "The AI returned a response with no text content."), ctx);
+        }
+
         // 4. Format and return
         const formatted = formatMessageResponse(response);
         const dirLabel = directory ? `Directory: ${directory}` : "Directory: (server default)";
@@ -352,6 +369,19 @@ export function registerWorkflowTools(
           : await client.post(`/session/${sessionId}/message`, body, { directory });
 
         const analysis = analyzeMessageResponse(response);
+
+        // Empty response → EMPTY_RESPONSE structured error (issue #26).
+        if (analysis.isEmpty) {
+          const respParts = (response as { parts?: unknown[] } | null | undefined)?.parts;
+          const ctx: { providerID?: string; modelID?: string; sessionId?: string; responseParts?: unknown[] } = {
+            providerID,
+            modelID,
+            sessionId,
+          };
+          if (Array.isArray(respParts)) ctx.responseParts = respParts;
+          return toolError(new EmptyResponseError(analysis.warning ?? "The AI returned a response with no text content."), ctx);
+        }
+
         const formatted = formatMessageResponse(response);
         const parts: string[] = [];
         if (formatted) parts.push(formatted);
@@ -784,7 +814,27 @@ export function registerWorkflowTools(
               ? (await sdk.session.messages({ path: { id: sid! }, query: { limit: 1 } })).data
               : await client.get(`/session/${sid}/message`, { limit: "1" }, directory);
             const arr = messages as unknown[];
-            const lastMsg = arr.length > 0 ? formatMessageResponse(arr[arr.length - 1]) : "";
+            const lastMsgRaw = arr.length > 0 ? arr[arr.length - 1] : null;
+
+            // Issue #26 — empty assistant message after session.idle was the
+            // headline silent-fail mode (out-of-roster OpenRouter dispatches
+            // returned "(no response text)" with Status: completed and no
+            // structured error).  Surface it as EMPTY_RESPONSE so the
+            // opencode-fallback-chain skill can route the failure correctly,
+            // instead of letting the caller treat completed as success.
+            const analysis = analyzeMessageResponse(lastMsgRaw);
+            if (analysis.isEmpty) {
+              const respParts = (lastMsgRaw as { parts?: unknown[] } | null | undefined)?.parts;
+              const ctx: { providerID?: string; modelID?: string; sessionId?: string; responseParts?: unknown[] } = {
+                providerID,
+                modelID,
+                sessionId: sid,
+              };
+              if (Array.isArray(respParts)) ctx.responseParts = respParts;
+              return toolError(new EmptyResponseError(analysis.warning ?? "Session reached idle but the assistant message contains no text content."), ctx);
+            }
+
+            const lastMsg = lastMsgRaw ? formatMessageResponse(lastMsgRaw) : "";
 
             // Get todo summary
             let todoSummary = "";
@@ -1044,6 +1094,24 @@ export function registerWorkflowTools(
         const messages = (sdk
           ? (await sdk.session.messages({ path: { id: sid! } })).data
           : await client.get(`/session/${sid}/message`, undefined, directory)) as unknown[];
+
+        // Issue #26 — same EMPTY_RESPONSE check as opencode_run.  Even though
+        // session.idle fired correctly, the assistant may have produced zero
+        // content (out-of-roster model, silent quota exhaustion, etc.).
+        // Surface it instead of returning a clean toolResult.
+        const lastMsgRaw = messages.length > 0 ? messages[messages.length - 1] : null;
+        const analysis = analyzeMessageResponse(lastMsgRaw);
+        if (analysis.isEmpty) {
+          const respParts = (lastMsgRaw as { parts?: unknown[] } | null | undefined)?.parts;
+          const ctx: { providerID?: string; modelID?: string; sessionId?: string; responseParts?: unknown[] } = {
+            providerID,
+            modelID,
+            sessionId: sid,
+          };
+          if (Array.isArray(respParts)) ctx.responseParts = respParts;
+          return toolError(new EmptyResponseError(analysis.warning ?? "session.idle fired but the assistant message contains no text content."), ctx);
+        }
+
         const formatted = formatMessageList(messages);
         const eventSummary = Object.entries(eventCounts)
           .map(([t, n]) => `${n}x ${t}`)

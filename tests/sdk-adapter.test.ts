@@ -182,6 +182,105 @@ describe("SDK adapter (createCoworkClient)", () => {
       // No-op assertion: the function exists and doesn't throw
       expect(true).toBe(true);
     });
+
+    // ── Regression tests for issue #27 (over-application of dedup) ─────
+    //
+    // The pre-#27 fingerprint was `${method}:${path}:cl=${content-length}`,
+    // which collided on:
+    //   (a) two POSTs to the same path with different bodies of equal length
+    //   (b) two POSTs with the same body but different `x-opencode-directory`
+    //       (because the header wasn't in the key)
+    // Both produced "the first response is served to the second caller",
+    // which surfaced as `opencode_shell_execute` returning the wrong command's
+    // output and `session_create` returning a session attributed to the wrong
+    // directory.  These two tests pin the fixed behaviour.
+
+    it("does NOT dedup two POSTs to the same path with DISTINCT bodies (issue #27)", async () => {
+      const client = createClient({});
+      let callCount = 0;
+      fetchMock.mockImplementation(() => {
+        callCount += 1;
+        return new Response(
+          JSON.stringify({
+            id: `ses_${callCount}`,
+            title: `title_${callCount}`,
+            time: { created: callCount, updated: callCount },
+            projectID: "p1",
+            directory: "/tmp",
+            version: "1",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      });
+
+      // Two POSTs to /session with DIFFERENT titles.  The pre-#27 fingerprint
+      // would dedup them whenever the JSON serializations happened to share a
+      // content-length (e.g. {"title":"ab"} and {"title":"cd"} both 14 bytes).
+      // We use two titles guaranteed to share length to make the test sharp.
+      const [r1, r2] = await Promise.all([
+        client.session.create({ body: { title: "ab" } }),
+        client.session.create({ body: { title: "cd" } }),
+      ]);
+
+      // Both POSTs must reach the network.  Pre-fix: fetch called ONCE,
+      // r2.data.id === "ses_1" (wrong) — the cached response from r1 was served.
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      expect((r1.data as { id: string })?.id).toBe("ses_1");
+      expect((r2.data as { id: string })?.id).toBe("ses_2");
+    });
+
+    it("does NOT dedup two POSTs with same body but DIFFERENT directories (issue #27 cross-contamination)", async () => {
+      const { tmpdir } = await import("node:os");
+      const { mkdtempSync } = await import("node:fs");
+      const { join } = await import("node:path");
+
+      const dirA = mkdtempSync(join(tmpdir(), "sdk-adapter-test-dirA-"));
+      const dirB = mkdtempSync(join(tmpdir(), "sdk-adapter-test-dirB-"));
+
+      vi.stubEnv("OPENCODE_MCP_TRANSLATE_PATHS", "none");
+
+      const clientA = createClient({ directory: dirA });
+      const clientB = createClient({ directory: dirB });
+
+      let callCount = 0;
+      fetchMock.mockImplementation((req: Request) => {
+        callCount += 1;
+        const dir = req.headers.get("x-opencode-directory") ?? "(none)";
+        return new Response(
+          JSON.stringify({
+            id: `ses_${callCount}`,
+            title: "same",
+            time: { created: callCount, updated: callCount },
+            projectID: dir, // echo dir back so we can assert per-caller routing
+            directory: dir,
+            version: "1",
+          }),
+          { status: 200, headers: { "content-type": "application/json" } },
+        );
+      });
+
+      // Both clients send a POST with the SAME body { title: "same" }, but
+      // their directories differ.  Pre-#27 fingerprint ignored the directory,
+      // so the second call was served clientA's cached response — clientB ended
+      // up with a session attributed to dirA.  This is the bug we observed
+      // 2026-05-18 when two parallel `opencode_session_create` calls returned
+      // the same session ID.
+      const [r1, r2] = await Promise.all([
+        clientA.session.create({ body: { title: "same" } }),
+        clientB.session.create({ body: { title: "same" } }),
+      ]);
+
+      expect(fetchMock).toHaveBeenCalledTimes(2);
+      // Each call must see its own directory header — no cross-contamination.
+      const dirsSeen = fetchMock.mock.calls
+        .map(([req]: [Request]) => req.headers.get("x-opencode-directory"))
+        .sort();
+      expect(dirsSeen).toEqual([dirA, dirB].sort());
+      // And the responses must come back to the correct caller (different IDs).
+      const id1 = (r1.data as { id: string })?.id;
+      const id2 = (r2.data as { id: string })?.id;
+      expect(id1).not.toBe(id2);
+    });
   });
 
   // ─────────────────────────────────────────────────────────────────────

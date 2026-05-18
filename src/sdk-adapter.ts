@@ -136,19 +136,61 @@ function isConnectionError(err: Error): boolean {
 
 // ── Request body fingerprint (for idempotency key) ─────────────────────
 //
-// The Request body is a ReadableStream that we cannot consume here without
-// preventing the actual fetch from sending it.  Content-Length is a cheap,
-// non-consuming proxy: two requests to the same path with the same body size
-// are likely identical for dedup purposes.  Combined with the TTL window
-// (default 60s), false positives are negligible in practice.
+// As of issue #27 (opencode-mcp), we consume the request body once early in
+// `customFetch` (see below) to compute a SHA-256 fingerprint instead of
+// using the cheap-but-collision-prone (METHOD, PATH, content-length) proxy
+// that the original implementation relied on.
 //
-// Phase C may add full body hashing by intercepting at the SDK call level
-// (before serialisation) — that would let us dedup with mathematical
-// certainty rather than statistical, but requires touching the SDK wrapper.
+// The old fingerprint caused two distinct bug classes in production:
+//
+//   1. Two `opencode_shell_execute` POSTs in the same session with different
+//      `command` strings of similar length would collide on content-length,
+//      returning the FIRST tool-call's cached Response to the second caller
+//      (same `callID`, same `prt_*`).  Documented in issue #27.
+//
+//   2. Two `session.create` POSTs from clients with different
+//      `x-opencode-directory` headers but identical body would collide on
+//      (path, content-length) — the header was not part of the key — so the
+//      second `session_create` returned the first session's data, mis-attributed
+//      to the wrong directory.  Observed 2026-05-18 during the same
+//      investigation as #27.
+//
+// The new key is `${method}:${path}:dir=${directory}:body=${sha256(body)}`,
+// where:
+//   - `directory` is the wrapper-injected directory (from
+//     `normalizedDirectory`, not the raw header — at the time we build the
+//     key the header has not been set yet in `customFetch`);
+//   - `body` is the hex digest of SHA-256 over the serialized body bytes,
+//     truncated to 16 hex chars (8 bytes, ~10^-19 collision rate over our
+//     dedup window — overkill but cheap).
+//
+// Consequences:
+//   - GET/HEAD/OPTIONS/DELETE bypass dedup entirely (unchanged behaviour).
+//   - POST/PUT/PATCH dedup correctly on body and directory.
+//   - One SHA-256 per POST in customFetch; negligible vs network cost.
+//
+// The body is read via `await req.text()` early in `customFetch`, which
+// consumes `req.body`.  The wrapped `fetchReq` we send downstream is
+// constructed with the same text as a string body — fetch handles strings
+// natively without the `duplex: "half"` dance that the streaming-body
+// version required.
 
-function idempotencyFingerprint(method: string, path: string, headers: Headers): string {
-  const cl = headers.get("content-length") ?? "0";
-  return `${method}:${path}:cl=${cl}`;
+async function idempotencyFingerprint(
+  method: string,
+  path: string,
+  directory: string,
+  bodyText: string
+): Promise<string> {
+  let bodyHash = "empty";
+  if (bodyText.length > 0) {
+    const data = new TextEncoder().encode(bodyText);
+    const digest = await crypto.subtle.digest("SHA-256", data);
+    bodyHash = Array.from(new Uint8Array(digest))
+      .map((b) => b.toString(16).padStart(2, "0"))
+      .join("")
+      .slice(0, 16);
+  }
+  return `${method}:${path}:dir=${directory}:body=${bodyHash}`;
 }
 
 // ── Factory ────────────────────────────────────────────────────────────
@@ -193,13 +235,33 @@ export function createCoworkClient(opts: CoworkClientOptions): OpencodeClient {
     const urlObj = new URL(url);
     const path = urlObj.pathname;
 
-    // ── 1. Idempotency dedup check (MEK-284) ──
+    // ── Pre-read body for body-aware dedup (issue #27 fix) ──
     //
-    // Fingerprint via (method, path, Content-Length) — avoids reading
-    // the body stream (see idempotencyFingerprint() doc for rationale).
+    // Read the body once, early, so we can:
+    //   a) hash it for an accurate dedup key (see idempotencyFingerprint());
+    //   b) reuse the same text when building the downstream Request.
+    //
+    // GET/HEAD never carry a body, so we skip this work.  For any other
+    // method, we tolerate `req.body === null` (which happens when the SDK
+    // sends an explicit empty-body POST) by treating it as an empty string.
+    const carriesBody = method !== "GET" && method !== "HEAD";
+    const bodyText: string =
+      carriesBody && req.body ? await req.text() : "";
+
+    // ── 1. Idempotency dedup check (MEK-284, fixed in issue #27) ──
+    //
+    // Fingerprint is body-aware AND directory-aware: two POSTs to the same
+    // path with different commands / titles / directories produce distinct
+    // keys and DO NOT collide in the cache.  See idempotencyFingerprint()
+    // for the full rationale and the bug-class history.
     let dedupKey: string | undefined;
     if (IDEMPOTENCY_WINDOW_MS > 0 && IDEMPOTENT_METHODS.has(method)) {
-      dedupKey = idempotencyFingerprint(method, path, req.headers);
+      dedupKey = await idempotencyFingerprint(
+        method,
+        path,
+        normalizedDirectory ?? "",
+        bodyText
+      );
 
       // Lazy GC: drop expired entries
       const now = Date.now();
@@ -217,7 +279,11 @@ export function createCoworkClient(opts: CoworkClientOptions): OpencodeClient {
       if (existing) return existing.promise.then((r) => r.clone());
     }
 
-    // ── 2. Build modified request with Cowork headers ──
+    // ── 2. Build modified request with Cowork headers + the body text ──
+    //
+    // Body is passed as a string (not the original ReadableStream, which
+    // has been consumed by the early `await req.text()` above).  String
+    // bodies don't require the `duplex: "half"` half-duplex hint.
     const headers = new Headers(req.headers);
     if (normalizedDirectory) {
       headers.set("x-opencode-directory", normalizedDirectory);
@@ -229,8 +295,7 @@ export function createCoworkClient(opts: CoworkClientOptions): OpencodeClient {
     const fetchReq = new Request(url, {
       method: req.method,
       headers,
-      body: req.body,
-      ...(req.body ? { duplex: "half" as const } : {}),
+      body: carriesBody ? bodyText : undefined,
     });
 
     // ── 3. Core fetch logic (retry loop + error handling) ──

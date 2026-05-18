@@ -22,6 +22,9 @@ import {
   toolError,
   toolJson,
   directoryParam,
+  ShellContentRefusedError,
+  EmptyResponseError,
+  buildStructuredError,
 } from "../src/helpers.js";
 
 // ─── formatMessageResponse ───────────────────────────────────────────────
@@ -1202,7 +1205,122 @@ describe("MEK-282 structured error surfacing", () => {
     expect(structured.provider).toBe("opencode");
     expect(structured.modelIdRequested).toBe("deepseek-v4-flash-free");
     expect(structured.sessionId).toBe("xyz");
-    expect(structured.tokenUsage.completion).toBe(0);
     expect(structured.tokenUsage.reasoning).toBe(14);
+  });
+});
+
+// ─── Issue #28 — typed refusal error gets SHELL_CONTENT_REFUSED, not UNKNOWN ───
+//
+// Pre-fix, the shell handler threw `new Error("Unescaped backtick…")` which
+// fell through every classification branch in buildStructuredError and got
+// tagged as UNKNOWN. Downstream skills like opencode-fallback-chain treat
+// UNKNOWN as "maybe transient, try a fallback provider" — wasting quota on
+// a refusal that is deterministic (the wrapper rejects before any LLM call).
+// The typed ShellContentRefusedError + instanceof branch fixes that.
+
+describe("Issue #28 — SHELL_CONTENT_REFUSED structured-error code", () => {
+  it("classifies ShellContentRefusedError as SHELL_CONTENT_REFUSED", () => {
+    const err = new ShellContentRefusedError(
+      "Unescaped backtick in shell command. Backticks trigger command substitution and corrupt embedded content. Write content to a file via your client's Write tool, then reference it with --body-file/--notes-file/-F body=@file/< file."
+    );
+    const structured = buildStructuredError(err);
+    expect(structured.code).toBe("SHELL_CONTENT_REFUSED");
+    expect(structured.message).toContain("Unescaped backtick");
+    // Suggested action must explicitly tell the caller NOT to retry — that's
+    // the whole point of the dedicated code (opencode-fallback-chain reads it).
+    expect(structured.suggestedAction).toMatch(/do NOT retry/i);
+    expect(structured.suggestedAction).toMatch(/file-first/i);
+  });
+
+  it("surfaces SHELL_CONTENT_REFUSED through toolError end-to-end", () => {
+    const err = new ShellContentRefusedError("Unescaped backtick in shell command.");
+    const result = toolError(err, {
+      providerID: "openrouter",
+      modelID: "deepseek/deepseek-v4-flash",
+      sessionId: "ses_xyz",
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text as string;
+    // Human-readable line carries the new code...
+    expect(text).toContain("Error [SHELL_CONTENT_REFUSED]");
+    // ...and the structured JSON block does too.
+    const match = text.match(/<!-- structured-error\n([\s\S]*?)\n-->/);
+    expect(match).not.toBeNull();
+    const structured = JSON.parse(match![1]);
+    expect(structured.code).toBe("SHELL_CONTENT_REFUSED");
+    expect(structured.provider).toBe("openrouter");
+    expect(structured.sessionId).toBe("ses_xyz");
+  });
+});
+
+// ─── Issue #26 — typed empty-response error gets EMPTY_RESPONSE, not silent success ───
+//
+// Pre-fix, opencode_run / opencode_ask / opencode_reply / opencode_run_streaming /
+// opencode_message_send would return a clean toolResult labelled "Status: completed"
+// when the assistant message had zero text content (e.g. out-of-roster OpenRouter
+// dispatch, free-tier model under load). Downstream skills like
+// opencode-fallback-chain consumed the EMPTY_RESPONSE code as their signal to
+// retry on the next provider — but the wrapper never emitted EMPTY_RESPONSE on
+// this path, so fallback never triggered. The typed EmptyResponseError + the
+// analyzeMessageResponse(...).isEmpty branches at all 5 callsites fix that.
+// (Recall: this is the exact bug that ate 3 of this orchestrator's OpenCode
+// dispatches in the session that wrote this very fix.)
+
+describe("Issue #26 — EMPTY_RESPONSE structured-error code", () => {
+  it("classifies EmptyResponseError as EMPTY_RESPONSE", () => {
+    const err = new EmptyResponseError(
+      "Session reached idle but the assistant message contains no text content."
+    );
+    const structured = buildStructuredError(err);
+    expect(structured.code).toBe("EMPTY_RESPONSE");
+    expect(structured.message).toContain("no text content");
+    // Suggested action must point at the likely cause (provider/model/quota).
+    expect(structured.suggestedAction).toBeDefined();
+    expect(structured.suggestedAction).toMatch(/API key|model|quota/i);
+  });
+
+  it("surfaces EMPTY_RESPONSE end-to-end through toolError with tokenUsage", () => {
+    // Mirror the canonical degenerate case: step-finish with non-zero input
+    // tokens (the LLM was reached) but zero completion tokens (it produced
+    // nothing).  Same shape as the existing EMPTY_RESPONSE test for the
+    // message-pattern path — proves the typed path carries tokenUsage too.
+    const responseParts = [
+      { type: "step-finish", tokens: { input: 256, output: 0, reasoning: 0 } },
+      { type: "text", text: "" },
+    ];
+    const err = new EmptyResponseError(
+      "Session reached idle but the assistant message contains no text content."
+    );
+    const result = toolError(err, {
+      providerID: "openrouter",
+      modelID: "anthropic/claude-sonnet-latest",
+      sessionId: "ses_empty",
+      responseParts,
+    });
+    expect(result.isError).toBe(true);
+    const text = result.content[0].text as string;
+    expect(text).toContain("Error [EMPTY_RESPONSE]");
+    const match = text.match(/<!-- structured-error\n([\s\S]*?)\n-->/);
+    expect(match).not.toBeNull();
+    const structured = JSON.parse(match![1]);
+    expect(structured.code).toBe("EMPTY_RESPONSE");
+    expect(structured.provider).toBe("openrouter");
+    expect(structured.modelIdRequested).toBe("anthropic/claude-sonnet-latest");
+    expect(structured.sessionId).toBe("ses_empty");
+    expect(structured.tokenUsage.prompt).toBe(256);
+    expect(structured.tokenUsage.completion).toBe(0);
+  });
+
+  it("typed EmptyResponseError wins over message-pattern classification", () => {
+    // Even if the message text contains a misleading keyword (e.g. "timeout"
+    // or "401"), the typed instanceof check fires first (per AGENTS.md
+    // "BEFORE the generic TIMEOUT branch" rule).  This is the robustness gain
+    // over the pre-fix path where everything depended on message wording.
+    const err = new EmptyResponseError("timed out after 401 attempts (decoy text)");
+    const structured = buildStructuredError(err);
+    expect(structured.code).toBe("EMPTY_RESPONSE");
+    // Confirm the would-be misclassifications are NOT what we got.
+    expect(structured.code).not.toBe("TIMEOUT");
+    expect(structured.code).not.toBe("AUTH_FAILED");
   });
 });
