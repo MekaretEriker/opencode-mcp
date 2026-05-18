@@ -9,6 +9,16 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.12.1-mekareteriker.0] - 2026-05-18
+
+### Changed
+
+- `[fork]` **#25 — `opencode_shell_execute` description rewritten to redirect content-passing to the file-first pattern.** Adopts the discipline-in-tool-description approach used by `NousResearch/hermes-agent` (see `write_file` / `terminal` tool descriptions in their tools reference). The shell tool description now explicitly tells callers to write content to a file via their client's Write tool and reference it with `--body-file` / `--notes-file` / `-F body=@file` / `< file`, rather than inlining content with heredocs or quoted strings. Targets the LLM-driving-shell escape failure mode documented in [`anomalyco/opencode#15810`](https://github.com/anomalyco/opencode/issues/15810) (closed) and [`anthropics/claude-code#29619`](https://github.com/anthropics/claude-code/issues/29619) (closed not-planned). See [issue #25](https://github.com/MekaretEriker/opencode-mcp/issues/25) for the full post-mortem of 6 observed failures across `gh issue close --comment`, `gh release create --notes`, and heredoc-based file writes.
+
+### Added
+
+- `[fork]` **#25 — backtick refusal in `opencode_shell_execute` handler.** Commands containing unescaped backticks (matching `/(?<!\\)`/`) are refused with an instructive error pointing to the file-first pattern. Conservative safety net — has false positives on legitimate `` `hostname` `` uses; workaround is the POSIX `$(hostname)` form. Will be gated behind `OPENCODE_MCP_ALLOW_BACKTICKS=1` env var in a follow-up if false-positive complaints accumulate. Three new tests added in `tests/tools.test.ts`: refusal fires on inlined backticks, clean commands pass through, escaped backticks pass through.
+
 ## [1.12.0-mekareteriker.0] - 2026-05-17
 
 ### Added
