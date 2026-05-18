@@ -260,7 +260,21 @@ export function registerMessageTools(
 
   server.tool(
     "opencode_shell_execute",
-    "Run a shell command through the opencode session",
+    [
+      "Run a shell command through the opencode session.",
+      "",
+      "For commands embedding content (issue/PR bodies, release notes,",
+      "commit messages, multiline text, anything with backticks, dollar-",
+      "signs, single or double quotes, newlines, or heredocs): write the",
+      "content to a file FIRST via your client's Write/file tool, then",
+      "reference the file in this command with --body-file, --notes-file,",
+      "-F body=@file, or input redirection (< file). Do NOT inline content",
+      "with heredocs or quoted strings — the shell will eat backticks as",
+      "command substitution and break quoting.",
+      "",
+      "Good:   gh issue create --body-file /tmp/body.md",
+      "Bad:    gh issue create --body \"$(cat <<'EOF'...EOF)\"",
+    ].join("\n"),
     {
       sessionId: z.string().describe("Session ID"),
       command: z.string().describe("Shell command to execute"),
@@ -273,6 +287,18 @@ export function registerMessageTools(
     async ({ sessionId, command, agent, providerID, modelID, variant, directory }) => {
       const sdk = sdkFactory?.(directory);
       try {
+        // #25 — file-first content discipline. Unescaped backticks trigger
+        // command substitution and corrupt embedded content. Refuse and
+        // teach the alternative.
+        if (/(?<!\\)`/.test(command)) {
+          throw new Error(
+            "Unescaped backtick in shell command. Backticks trigger command " +
+            "substitution and corrupt embedded content. Write content to a " +
+            "file via your client's Write tool, then reference it with " +
+            "--body-file/--notes-file/-F body=@file/< file. See " +
+            "https://github.com/MekaretEriker/opencode-mcp/issues/25"
+          );
+        }
         const body: Record<string, unknown> = { command, agent };
         const shellModel = applyModelDefaults(providerID, modelID, variant);
         if (shellModel) body.model = shellModel;

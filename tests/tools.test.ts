@@ -1176,6 +1176,63 @@ describe("Tool handlers", () => {
     });
   });
 
+  describe("opencode_shell_execute (#25 — file-first content discipline)", () => {
+    function setup(postMock?: ReturnType<typeof vi.fn>) {
+      const post = postMock ?? vi.fn().mockResolvedValue({});
+      const mockClient = createMockClient({ post });
+      const tools = new Map<string, Function>();
+      const mockServer = {
+        tool: vi.fn((...args: unknown[]) => {
+          tools.set(args[0] as string, args[args.length - 1] as Function);
+        }),
+      } as unknown as McpServer;
+      registerMessageTools(mockServer, mockClient);
+      return { handler: tools.get("opencode_shell_execute")!, post };
+    }
+
+    it("refuses commands with unescaped backticks and points to the file-first pattern", async () => {
+      const { handler, post } = setup();
+      const result = await handler({
+        sessionId: "s1",
+        command: 'gh issue create --body "see `foo.ts`"',
+        agent: "build",
+      });
+      const text = result.content[0].text as string;
+      expect(text).toContain("Unescaped backtick");
+      expect(text).toContain("--body-file");
+      expect(post).not.toHaveBeenCalled();
+    });
+
+    it("lets clean commands through to the shell endpoint", async () => {
+      const post = vi.fn().mockResolvedValue({
+        info: { id: "m1", role: "assistant" },
+        parts: [{ type: "text", text: "ok" }],
+      });
+      const { handler } = setup(post);
+      const result = await handler({
+        sessionId: "s1",
+        command: "ls -la",
+        agent: "build",
+      });
+      expect(post).toHaveBeenCalledOnce();
+      const [path, body] = post.mock.calls[0];
+      expect(path).toBe("/session/s1/shell");
+      expect(body).toMatchObject({ command: "ls -la", agent: "build" });
+      const text = result.content[0].text as string;
+      expect(text).not.toContain("Unescaped backtick");
+    });
+
+    it("accepts escaped backticks (\\`) without firing the refusal", async () => {
+      const { handler, post } = setup();
+      await handler({
+        sessionId: "s1",
+        command: "echo \\`literal\\`",
+        agent: "build",
+      });
+      expect(post).toHaveBeenCalledOnce();
+    });
+  });
+
   describe("opencode_session_share (R5-B2 fix)", () => {
     it("formats output with share URL instead of raw JSON", async () => {
       const mockClient = createMockClient({
