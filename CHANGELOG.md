@@ -9,6 +9,62 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.12.2-mekareteriker.0] - 2026-05-18
+
+### Fixed
+
+- `[fork]` **#26 — `EMPTY_RESPONSE` now fires on zero-content assistant message (out-of-roster OpenRouter silent-fail).** Before this release, `opencode_run` / `opencode_run_streaming` / `opencode_ask` / `opencode_reply` / `opencode_message_send` would all return a clean `toolResult` labelled `Status: completed` when the session reached idle with an empty assistant message — no error surfaced, no structured-error block emitted. Out-of-roster OpenRouter dispatches (e.g. `anthropic/claude-sonnet-latest` when the operator's `OPENROUTER-MODELS.md` excludes it) and free-tier models under load (`qwen/qwen3-coder:free`, etc.) silently produced this state. Downstream `opencode-fallback-chain` could not trigger fallback because the wrapper never signalled the failure.
+
+  Witnessed directly while writing this fix: during the same Cowork session that produced the #27 patch, **three consecutive `opencode_fire` dispatches** (claude-sonnet-4.5, claude-opus-4.5, deepseek-chat-v3.1 — three providers, three models) all returned the documented "(no content)" silent-success — the orchestrator was forced to abandon OpenCode dispatch entirely and fall back to direct file edits. That outcome is the canonical failure mode this fix closes.
+
+  **Fix**:
+  - **`EmptyResponseError` class** exported from `src/helpers.ts` — typed `Error` subclass carrying `code: "EMPTY_RESPONSE"`. Same pattern as `ShellContentRefusedError` from #28: typed errors win over message-pattern classification in `buildStructuredError` via an `instanceof` fast-path.
+  - **`buildStructuredError` branch**: `instanceof EmptyResponseError` checked before any HTTP-status / message-pattern branch. The pre-existing `lower.includes("no text content") || lower.includes("empty response")` pattern-matcher is preserved as a fallback for any code that still throws plain `Error` with those wordings (older callers, third-party tools).
+  - **Five callsites patched** to throw `EmptyResponseError` (caught by their `try/catch` → `toolError(e, ctx)` → structured-error block with `code: "EMPTY_RESPONSE"`):
+    - `src/tools/workflow.ts` — `opencode_ask` (the v1.1.0-era `analyzeMessageResponse(response).isEmpty` branch now throws instead of appending `--- WARNING ---` text);
+    - `src/tools/workflow.ts` — `opencode_reply` (same);
+    - `src/tools/workflow.ts` — `opencode_run` (NEW: the polling path at `status === "idle" || status === "completed"` now calls `analyzeMessageResponse` on the last message before reporting success — this is the headline bug from the issue);
+    - `src/tools/workflow.ts` — `opencode_run_streaming` (NEW: after `session.idle` fires, the post-fetch message list is checked for empty content);
+    - `src/tools/message.ts` — `opencode_message_send` (same as ask/reply).
+  - **`responseParts` ctx** is forwarded to `toolError` at each site so the structured-error block carries `tokenUsage` extracted from the `step-finish` part — the operator can see "input: 256, completion: 0" and immediately diagnose "LLM was reached but produced nothing" vs "request never landed".
+
+  **Behavioural change for callers**: any code that previously checked for `--- WARNING ---` text in the response on these tools must now check `result.isError === true` and parse the `<!-- structured-error -->` JSON block (or just react to `code: "EMPTY_RESPONSE"` directly). The `opencode-fallback-chain` skill on the Cowork side already maps `EMPTY_RESPONSE → trigger fallback` (documented since opencode-agent v1.1.0), so this is the wire-up that makes that mapping actually fire.
+
+  **Tests** (`tests/helpers.test.ts` + `tests/tools.test.ts`):
+  - New `describe("Issue #26 — EMPTY_RESPONSE structured-error code")` block in `helpers.test.ts` with 3 unit tests: classifies typed error, surfaces end-to-end through `toolError` with tokenUsage extraction, typed error wins over decoy `timeout`/`401` message text.
+  - 5 pre-existing `tests/tools.test.ts` tests updated from "warns when response is empty" (asserted the old `--- WARNING ---` behaviour) to "surfaces EMPTY_RESPONSE when response is empty/null (issue #26)" (asserts `result.isError === true` and `Error [EMPTY_RESPONSE]` in the human line plus `"code": "EMPTY_RESPONSE"` in the JSON block).
+  - Full suite: **373 passed / 5 skipped / 0 failed across 7 files** (was 370 from #28). Net +3 from #26's 3 new unit tests; existing tests preserved minus the 5 renames.
+
+  **Out of scope (per the issue)**: pre-flight model validation against the operator's `OPENROUTER-MODELS.md` roster. That's an orchestrator-side concern (handled by a future skill update or by the planned MEK-286 preflight provider skill in `opencode-agent` backlog #38). This ticket only surfaces empty-content as an error after the fact — the wrapper now behaves correctly regardless of why the session went empty.
+
+  See [issue #26](https://github.com/MekaretEriker/opencode-mcp/issues/26).
+
+### Added
+
+- `[fork]` **#28 — new `SHELL_CONTENT_REFUSED` structured-error code + typed `ShellContentRefusedError` class (polish for #25).** The backtick-refusal path in `opencode_shell_execute` used to throw `new Error("Unescaped backtick…")`, which fell through every classification branch in `buildStructuredError` and surfaced as `code: "UNKNOWN"`. Downstream skills (especially [`opencode-agent`'s `opencode-fallback-chain`](https://github.com/MekaretEriker/opencode-agent-for-cowork/tree/main/skills/opencode-fallback-chain)) treat `UNKNOWN` as "maybe transient, try a fallback provider" — wasting provider quota on a refusal that is *deterministic* (the wrapper rejects before any LLM call ever fires; switching provider would yield the same refusal). This release introduces:
+  - **`ShellContentRefusedError` class** exported from `src/helpers.ts` — typed `Error` subclass carrying `code: "SHELL_CONTENT_REFUSED"`. Documented as "the wrapper-level discipline refusal — do NOT retry on a different provider" in JSDoc.
+  - **`SHELL_CONTENT_REFUSED` value** added to the `StructuredErrorCode` union.
+  - **Classification fast-path** in `buildStructuredError`: `instanceof ShellContentRefusedError` is checked BEFORE any HTTP-status / message-pattern branch (promoted to first position per AGENTS.md's "BEFORE the generic TIMEOUT branch" rule, here taken to its logical extreme — typed errors are unambiguous).
+  - **`getSuggestedAction` mapping** with explicit "do NOT retry on a different provider" language and a link to issue #25 explaining the file-first pattern callers should rewrite their command into.
+  - **Refusal site updated** in `src/tools/message.ts` to throw `new ShellContentRefusedError(...)` instead of `new Error(...)`. Same error message wording, same regex trigger — only the type changes.
+
+  Acceptance criteria (per issue #28) all satisfied: refusal emits a non-`UNKNOWN` code; new tests in `tests/helpers.test.ts` assert `buildStructuredError(new ShellContentRefusedError(...))` returns `code: "SHELL_CONTENT_REFUSED"` AND that `toolError` surfaces it end-to-end (both the human line `Error [SHELL_CONTENT_REFUSED]: ...` and the JSON in the `<!-- structured-error -->` block). Pre-existing refusal tests in `tests/tools.test.ts` are unchanged and still pass — the refusal text and absence of the downstream POST are unchanged. Full suite: **370 passed / 5 skipped / 0 failed across 7 files** (was 368 from #27). See [issue #28](https://github.com/MekaretEriker/opencode-mcp/issues/28). Companion change in [`opencode-agent`'s `opencode-fallback-chain` skill](https://github.com/MekaretEriker/opencode-agent-for-cowork/blob/main/skills/opencode-fallback-chain/SKILL.md) maps the new code to "do not retry" so downstream callers route the error sensibly.
+
+### Fixed
+
+- `[fork]` **#27 — `opencode_shell_execute` dedup over-application (MEK-284 cache key was not body-aware).** The idempotency layer in `src/sdk-adapter.ts` keyed cache entries on `${method}:${path}:cl=${content-length}` — a cheap content-length proxy that collided whenever two POST bodies happened to serialize to the same length. In practice, this caused:
+  1. Two `opencode_shell_execute` POSTs in the same session with different `command` strings of similar length returned the FIRST tool-call's cached Response to the second caller (same `callID`, `messageID`, `prt_*`). The second command was never executed. Observed across multiple sessions during the v1.12.1 release ritual on 2026-05-18 (ses_1c5f96d92ffe3ya84KnK27C5z6 and others) — the operator was forced to chain commands with `&&` and create a fresh session per dispatch as workaround.
+  2. Two `session.create` POSTs from clients with different `x-opencode-directory` headers but identical body collided on `(path, content-length)` because the header was not part of the key. The second `session_create` returned the first session's data, mis-attributed to the wrong directory. Observed 2026-05-18 when two parallel `opencode_session_create` calls (one targeting `opencode-mcp`, one targeting `opencode-agent`) returned the same session ID.
+
+  **Fix**: replaced the `idempotencyFingerprint(method, path, headers)` helper with an async, body-aware, directory-aware variant: `idempotencyFingerprint(method, path, directory, bodyText) → SHA-256-keyed string`. The request body is now consumed once early in `customFetch` via `await req.text()` and reused both for the cache key and for the downstream `fetchReq` (passed as a string body, which removes the need for `duplex: "half"`). The new key is `${method}:${path}:dir=${directory}:body=${sha256(body).slice(0,16)}` — collision rate ~10⁻¹⁹ over the 60s dedup window, vs. ~10⁻³ for the old proxy on similarly-shaped JSON bodies. One SHA-256 per POST in customFetch; negligible vs network cost.
+
+  **Regression coverage** (`tests/sdk-adapter.test.ts`):
+  - `does NOT dedup two POSTs to the same path with DISTINCT bodies (issue #27)` — pins the shell_execute-style bug (two POSTs to `/session` with titles `"ab"` and `"cd"` — pre-fix would dedup on shared content-length 14; post-fix both reach the network and return distinct session IDs).
+  - `does NOT dedup two POSTs with same body but DIFFERENT directories (issue #27 cross-contamination)` — pins the session_create-style bug (two clients with distinct `directory` values both POST `{title:"same"}`; post-fix both reach the network and the responses come back to the correct caller with the correct directory header).
+  - All 4 pre-existing dedup tests preserved (parallel-identical dedup still works, GET still bypassed, env-disabled mode still works, reset hook still works). Full suite: **368 passed / 5 skipped / 0 failed across 7 files**.
+
+  See [issue #27](https://github.com/MekaretEriker/opencode-mcp/issues/27) for the full post-mortem and the original Cowork repro. The companion idempotency layer that lives in `src/client.ts` (pre-Phase-C duplicate) is not touched in this fix — it is reachable only when the SDK adapter is bypassed, which is increasingly rare since the Phase C migration in 1.12.0. A follow-up should fold both layers into one shared module.
+
 ## [1.12.1-mekareteriker.0] - 2026-05-18
 
 ### Changed
