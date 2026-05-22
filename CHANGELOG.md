@@ -9,6 +9,38 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.13.0-mekareteriker.0] - 2026-05-22
+
+### Fixed
+
+- `[fork]` **#33 — Cross-OS directory resolution: POSIX-only paths fail on Windows client + Linux server.** On a Windows Cowork client targeting a Linux/WSL OpenCode server, passing a POSIX-only path (e.g. `/home/user/project`, `/root/foo`, `/tmp/bar`) to any MCP tool's `directory` parameter would fail with `Directory not found: "C:\home\user\project" does not exist.` because `normalizeDirectory()` passed the path through `path.resolve()` under Windows semantics, where the leading `/` is interpreted as "current drive root" — producing `C:\home\...` which never exists on Windows. `/mnt/<drive>/...` paths worked by accident because `wslToWindowsPath` translated them to `<drive>:\...` which *does* exist.
+
+  **Fix**:
+  - **Shape-driven cross-OS resolution** in `normalizeDirectory()`: if the client is Windows and the input starts with `/` but doesn't match `/mnt/<drive>/`, skip local `existsSync` validation and ship the path verbatim to the server. The server will return a clear "no such directory" error if the path is invalid — strictly better than the current cryptic `C:\home\...` error.
+  - **`OPENCODE_MCP_SERVER_OS=linux|win32|darwin|auto`** env var (default `auto`) as an escape hatch for the symmetric case (Linux client + Windows server). When set to `win32` on a Linux client, Windows drive-letter paths skip `existsSync` and ship verbatim. When set to `linux` or `darwin`, same as `auto` for the Windows-client side.
+  - **`getServerOsHint()`** private helper reads the env var, validates against allowed values, defaults to `auto`.
+  - **All existing behavior preserved**: Windows-on-Windows, WSL-mount translation (`/mnt/<drive>/...`), `OPENCODE_MCP_TRANSLATE_PATHS`.
+
+  | input shape | client OS | server OS hint | action |
+  |---|---|---|---|
+  | `C:\Users\...` | win32 | auto / linux / darwin | local validation + translation (unchanged) |
+  | `/mnt/<d>/...` | win32 | auto / linux / darwin | wslToWindowsPath → local validation (unchanged) |
+  | `/home/...`, `/root/...`, `/tmp/...` | win32 | auto / linux / darwin | skip local validation, ship verbatim to server |
+  | any | non-win32 | auto | local validation (unchanged) |
+  | `C:\Users\...` | non-win32 | win32 | skip local validation, ship verbatim |
+
+  **Tests** (`tests/helpers.test.ts`):
+  - New `describe("normalizeDirectory — cross-OS (Windows client + Linux server)")` block with 8 tests:
+    - 3 Windows-only (`it.runIf`) tests: `/home/`, `/root/`, `/tmp/` return verbatim.
+    - 1 Windows-only regression guard: `/mnt/z/...` still throws when the Windows form doesn't exist.
+    - 1 Linux test: non-existent POSIX path still throws (unchanged behavior).
+    - 1 Windows-only test: `OPENCODE_MCP_SERVER_OS=linux` confirmation.
+    - 1 Windows-only test: `OPENCODE_MCP_SERVER_OS=darwin` confirmation.
+    - 1 Linux test: `OPENCODE_MCP_SERVER_OS=win32` ships `C:\Users\foo` verbatim.
+  - Full suite: **375 passed / 11 skipped / 0 failed across 7 files** (was 370 from #26). Net +8 from #33's 8 new tests (2 run on Linux, 6 gated for Windows CI).
+
+  See [issue #33](https://github.com/MekaretEriker/opencode-mcp/issues/33).
+
 ## [1.12.2-mekareteriker.0] - 2026-05-18
 
 ### Fixed
