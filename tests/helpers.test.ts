@@ -1095,6 +1095,103 @@ describe("normalizeDirectory with WSL translation (MEK-289)", () => {
   );
 });
 
+// ─── #33 — Cross-OS directory resolution (Windows client + Linux server) ─
+
+describe("normalizeDirectory — cross-OS (Windows client + Linux server)", () => {
+  let _savedTranslate: string | undefined;
+  let _savedServerOs: string | undefined;
+  beforeEach(() => {
+    _savedTranslate = process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    _savedServerOs = process.env.OPENCODE_MCP_SERVER_OS;
+    process.env.OPENCODE_MCP_TRANSLATE_PATHS = "none";
+    delete process.env.OPENCODE_MCP_SERVER_OS;
+  });
+  afterEach(() => {
+    if (_savedTranslate === undefined) delete process.env.OPENCODE_MCP_TRANSLATE_PATHS;
+    else process.env.OPENCODE_MCP_TRANSLATE_PATHS = _savedTranslate;
+    if (_savedServerOs === undefined) delete process.env.OPENCODE_MCP_SERVER_OS;
+    else process.env.OPENCODE_MCP_SERVER_OS = _savedServerOs;
+  });
+
+  it.runIf(process.platform === "win32")(
+    "returns /home/user/foo verbatim (no C:\\ mangling) on Windows",
+    () => {
+      const result = normalizeDirectory("/home/user/foo");
+      expect(result).toBe("/home/user/foo");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "returns /root/foo verbatim on Windows",
+    () => {
+      const result = normalizeDirectory("/root/foo");
+      expect(result).toBe("/root/foo");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "returns /tmp/bar verbatim on Windows",
+    () => {
+      const result = normalizeDirectory("/tmp/bar");
+      expect(result).toBe("/tmp/bar");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "/mnt/d/... still throws if Windows form doesn't exist (regression guard)",
+    () => {
+      // /mnt/d/ translates to D:\\, and the path portion must not exist
+      expect(() =>
+        normalizeDirectory("/mnt/z/this/does/not/exist/xyzpdq999"),
+      ).toThrow("does not exist");
+
+      // But a real /mnt/d/ path that maps to an existing Windows dir
+      // should still work (use cwd to build a real one)
+      const cwd = process.cwd();
+      const wslForm = windowsToWslPath(cwd);
+      expect(wslForm).toMatch(/^\/mnt\/[a-z]\//);
+      const result = normalizeDirectory(wslForm);
+      expect(result).toBe(wslForm);
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "/this/path/does/not/exist/xyz123 still throws on Linux (unchanged)",
+    () => {
+      expect(() =>
+        normalizeDirectory("/this/path/does/not/exist/xyz123"),
+      ).toThrow("does not exist");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "with OPENCODE_MCP_SERVER_OS=linux, POSIX paths still ship verbatim on Windows",
+    () => {
+      process.env.OPENCODE_MCP_SERVER_OS = "linux";
+      const result = normalizeDirectory("/home/user/project");
+      expect(result).toBe("/home/user/project");
+    },
+  );
+
+  it.runIf(process.platform === "win32")(
+    "with OPENCODE_MCP_SERVER_OS=darwin, POSIX paths still ship verbatim on Windows",
+    () => {
+      process.env.OPENCODE_MCP_SERVER_OS = "darwin";
+      const result = normalizeDirectory("/Users/macuser/project");
+      expect(result).toBe("/Users/macuser/project");
+    },
+  );
+
+  it.runIf(process.platform !== "win32")(
+    "with OPENCODE_MCP_SERVER_OS=win32 on Linux, Windows paths ship verbatim",
+    () => {
+      process.env.OPENCODE_MCP_SERVER_OS = "win32";
+      const result = normalizeDirectory("C:\\Users\\foo");
+      expect(result).toBe("C:\\Users\\foo");
+    },
+  );
+});
+
 // ─── diagnoseError (via toolError) ───────────────────────────────────────
 
 describe("toolError diagnoseError enhancements", () => {
