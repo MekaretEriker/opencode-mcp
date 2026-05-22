@@ -130,6 +130,23 @@ function getPathTranslateMode(): PathTranslateMode {
 }
 
 /**
+ * Server OS hint for cross-OS path validation.
+ * Configurable via env `OPENCODE_MCP_SERVER_OS`:
+ *   - `linux` | `win32` | `darwin`  — explicit override
+ *   - `auto` (default) — infer from input shape and client OS
+ *
+ * When `auto`, paths that are unreachable from the client side but
+ * valid on the server side (e.g. POSIX-only `/home/...` on a Windows
+ * client targeting a Linux server) skip local `existsSync` validation
+ * and are shipped verbatim. See #33.
+ */
+function getServerOsHint(): "linux" | "win32" | "darwin" | "auto" {
+  const v = process.env.OPENCODE_MCP_SERVER_OS?.toLowerCase();
+  if (v === "linux" || v === "win32" || v === "darwin" || v === "auto") return v;
+  return "auto";
+}
+
+/**
  * Normalize and validate a directory path:
  *  - Accepts both POSIX and Windows absolute paths from the user
  *  - If client runs on Windows and a WSL-style input is provided, translates
@@ -143,6 +160,21 @@ function getPathTranslateMode(): PathTranslateMode {
  *    validated path to WSL form before returning, so the OpenCode server
  *    running in WSL/Linux receives a path it can actually use as cwd
  *
+ * Cross-OS behavior (client/server asymmetry, #33):
+ *
+ * | input shape | client OS | server OS hint | action |
+ * |---|---|---|---|
+ * | `C:\\Users\\...` | win32 | auto / linux / darwin | local validation + translation (unchanged) |
+ * | `/mnt/<d>/...` | win32 | auto / linux / darwin | wslToWindowsPath → local validation (unchanged) |
+ * | `/home/...`, `/root/...`, `/tmp/...` | win32 | auto / linux / darwin | skip local validation, ship verbatim to server |
+ * | any | non-win32 | auto | local validation (unchanged) |
+ * | `C:\\Users\\...` | non-win32 | win32 | skip local validation, ship verbatim |
+ *
+ * Use `OPENCODE_MCP_SERVER_OS=linux|win32|darwin|auto` (default `auto`) to
+ * override the server OS hint. `auto` infers from input shape and client OS
+ * per the matrix above. The existing `OPENCODE_MCP_TRANSLATE_PATHS` env var
+ * is an orthogonal concern and is not affected by this change.
+ *
  * Returns the normalized path (in the form the server expects), or
  * undefined if input was undefined. Throws a descriptive Error on
  * validation failure.
@@ -150,11 +182,40 @@ function getPathTranslateMode(): PathTranslateMode {
 export function normalizeDirectory(directory?: string): string | undefined {
   if (!directory) return undefined;
 
+  const clientOs = process.platform;
+  const serverOs = getServerOsHint();
+  const isWindowsDrive = /^[A-Za-z]:[\\/]/.test(directory);
+  const isWslMount = /^\/mnt\/[a-z]\//.test(directory);
+  const isPosixStyle = directory.startsWith("/");
+
+  // Explicit serverOs=win32 on a non-win32 client: Windows paths are
+  // unreachable from the client's filesystem, skip local validation
+  // and ship verbatim. The server reports its own error if invalid.
+  if (isWindowsDrive && clientOs !== "win32" && serverOs === "win32") {
+    return directory;
+  }
+
+  // POSIX-only paths (starts with "/" but not a WSL mount) on a Windows
+  // client: the server is a POSIX box (auto inference means the server
+  // OS differs from the client, explicit linux/darwin confirms it).
+  // These paths are unreachable from the Windows client — skip local
+  // `existsSync` and ship verbatim. The server will report a clear
+  // "no such directory" error if the path is invalid, which is strictly
+  // better than the current cryptic Windows-side `C:\\home\\...` error.
+  if (
+    isPosixStyle &&
+    !isWslMount &&
+    clientOs === "win32" &&
+    (serverOs === "auto" || serverOs === "linux" || serverOs === "darwin")
+  ) {
+    return directory;
+  }
+
   // Accept WSL paths even on Windows clients. `existsSync` on Windows
   // can't see `/mnt/d/...` but can see `D:\...` — translate WSL → Windows
   // BEFORE local validation. MEK-289.
   const inputForValidation =
-    process.platform === "win32" ? wslToWindowsPath(directory) : directory;
+    clientOs === "win32" ? wslToWindowsPath(directory) : directory;
 
   // Resolve to an absolute, platform-appropriate form. `resolve` handles
   // "..", ".", trailing slashes, and will convert a relative input against
@@ -188,7 +249,7 @@ export function normalizeDirectory(directory?: string): string | undefined {
   // that touched the filesystem silent-failed.
   const mode = getPathTranslateMode();
   const shouldTranslate =
-    mode === "wsl" || (mode === "auto" && process.platform === "win32");
+    mode === "wsl" || (mode === "auto" && clientOs === "win32");
 
   return shouldTranslate ? windowsToWslPath(normalized) : normalized;
 }
