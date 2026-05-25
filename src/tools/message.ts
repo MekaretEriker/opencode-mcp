@@ -12,13 +12,19 @@
  * falls back to the legacy `OpenCodeClient.post/get` methods, which
  * propagate `directory` per-request via the `{directory}` option.
  *
- * All 6 tools mapped to typed SDK methods — no gaps:
+ * Tools mapped to typed SDK methods — no gaps:
  * - `sdk.session.messages()`    → GET  /session/{id}/message (list)
  * - `sdk.session.message()`     → GET  /session/{id}/message/{messageID} (single)
  * - `sdk.session.prompt()`      → POST /session/{id}/message (sync)
  * - `sdk.session.promptAsync()` → POST /session/{id}/prompt_async
  * - `sdk.session.command()`     → POST /session/{id}/command
- * - `sdk.session.shell()`       → POST /session/{id}/shell
+ * - `sdk.session.shell()`       → POST /session/{id}/shell  (used by both
+ *   `opencode_shell_execute` and `opencode_write_file`)
+ *
+ * `opencode_write_file` (#39) is a content-discipline wrapper over
+ * `session.shell`: it composes a base64-decode pipeline so that file
+ * content never travels through the LLM stream (which deadlocks on
+ * certain payloads via DeepSeek/OpenRouter, see issue #39).
  */
 
 import { z } from "zod";
@@ -35,6 +41,7 @@ import {
   directoryParam,
   ShellContentRefusedError,
   EmptyResponseError,
+  composeWriteFileCommand,
 } from "../helpers.js";
 
 export function registerMessageTools(
@@ -319,6 +326,88 @@ export function registerMessageTools(
             "https://github.com/MekaretEriker/opencode-mcp/issues/25"
           );
         }
+        const body: Record<string, unknown> = { command, agent };
+        const shellModel = applyModelDefaults(providerID, modelID, variant);
+        if (shellModel) body.model = shellModel;
+        const result = sdk
+          ? (await sdk.session.shell({ path: { id: sessionId }, body: body as any })).data
+          : await client.post(
+              `/session/${sessionId}/shell`,
+              body,
+              { directory },
+            );
+        return toolResult(formatMessageResponse(result));
+      } catch (e) {
+        return toolError(e, { providerID, modelID, sessionId });
+      }
+    },
+  );
+
+  server.tool(
+    "opencode_write_file",
+    [
+      "Materialize a file on the session host without routing the content",
+      "through the LLM tool-call stream. Use this INSTEAD of asking the LLM",
+      "to write a file via its native `write` tool when the content is",
+      "prose / markdown >= 30 lines OR contains backticks, em-dashes,",
+      "accented characters, or fenced code blocks — the native `write`",
+      "tool stalls indefinitely on such payloads through certain providers",
+      "(DeepSeek / OpenRouter confirmed). See issue #39.",
+      "",
+      "How it works: the wrapper encodes `content` as base64 in Node and",
+      "composes `printf '%s' '<BASE64>' | base64 -d > <quoted-path>`, then",
+      "dispatches via the same `session/shell` endpoint as",
+      "opencode_shell_execute. Properties:",
+      "  - Content never enters the LLM stream (cause of the stall in #39).",
+      "  - Unicode preserved exactly (UTF-8 -> base64 -> UTF-8 round-trip).",
+      "  - Generated command contains NO backticks - passes the",
+      "    SHELL_CONTENT_REFUSED guard (#25/#28).",
+      "  - Path is single-quoted with POSIX-safe escaping for embedded",
+      "    quotes.",
+      "",
+      "After writing, you can reference the file in subsequent",
+      "opencode_shell_execute calls (--body-file, --notes-file, < file).",
+    ].join("\n"),
+    {
+      sessionId: z.string().describe("Session ID"),
+      path: z
+        .string()
+        .describe(
+          "Absolute path of the file to write on the session host (e.g. /tmp/body.md)",
+        ),
+      content: z
+        .string()
+        .describe(
+          "Raw file content. Unicode supported. No size limit beyond MCP transport.",
+        ),
+      agent: z
+        .string()
+        .describe(
+          "Agent to attribute the shell command to (same semantics as opencode_shell_execute)",
+        ),
+      providerID: z.string().optional().describe("Provider ID"),
+      modelID: z.string().optional().describe("Model ID"),
+      variant: z.string().optional().describe("Model variant"),
+      directory: directoryParam,
+    },
+    async ({
+      sessionId,
+      path: filePath,
+      content,
+      agent,
+      providerID,
+      modelID,
+      variant,
+      directory,
+    }) => {
+      const sdk = sdkFactory?.(directory);
+      try {
+        // Compose the base64-decode pipeline (see composeWriteFileCommand
+        // in helpers.ts).  Content never enters the LLM stream — that is
+        // the whole point of this tool vs. delegating to the native
+        // `write` tool (#39).
+        const command = composeWriteFileCommand(filePath, content);
+
         const body: Record<string, unknown> = { command, agent };
         const shellModel = applyModelDefaults(providerID, modelID, variant);
         if (shellModel) body.model = shellModel;

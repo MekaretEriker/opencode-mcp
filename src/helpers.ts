@@ -777,6 +777,37 @@ export class EmptyResponseError extends Error {
   }
 }
 
+/**
+ * Compose a POSIX shell command that materializes `content` at `filePath`
+ * on the session host via a base64-decode pipeline.
+ *
+ * Used by `opencode_write_file` (#39) to keep file content out of the LLM
+ * tool-call stream — the native opencode `write` tool stalls indefinitely
+ * on markdown payloads containing backticks/em-dashes/accents through
+ * certain providers (DeepSeek/OpenRouter).
+ *
+ * Properties of the returned command:
+ *   - Contains NO backticks → passes the SHELL_CONTENT_REFUSED guard (#25).
+ *   - Path is single-quoted with POSIX-safe escaping for embedded quotes
+ *     (the `\'\''` sequence), so paths with spaces / apostrophes / parens
+ *     all work.
+ *   - Uses `printf '%s'` instead of `echo` (POSIX echo behavior with
+ *     backslashes is implementation-defined).
+ *   - `base64` is GNU coreutils / BusyBox compatible — present on every
+ *     Linux/macOS opencode server target.
+ *
+ * Exported for unit testing in isolation from the SDK / network layer.
+ */
+export function composeWriteFileCommand(filePath: string, content: string): string {
+  const b64 = Buffer.from(content, "utf8").toString("base64");
+  // POSIX single-quote escape: close-escape-reopen.  The runtime sequence
+  // each `'` in the path becomes is the 4-char string ' \ ' '.  We build
+  // it with a regular JS string ("'\\''") rather than a nested backtick
+  // template literal — some TS parsers stumble on nested template literals.
+  const quotedPath = "'" + filePath.replace(/'/g, "'\\''") + "'";
+  return `printf '%s' '${b64}' | base64 -d > ${quotedPath}`;
+}
+
 export interface StructuredError {
   code: StructuredErrorCode;
   message: string;

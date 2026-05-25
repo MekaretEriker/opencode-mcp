@@ -25,6 +25,7 @@ import {
   ShellContentRefusedError,
   EmptyResponseError,
   buildStructuredError,
+  composeWriteFileCommand,
 } from "../src/helpers.js";
 
 // ─── formatMessageResponse ───────────────────────────────────────────────
@@ -1419,5 +1420,111 @@ describe("Issue #26 — EMPTY_RESPONSE structured-error code", () => {
     // Confirm the would-be misclassifications are NOT what we got.
     expect(structured.code).not.toBe("TIMEOUT");
     expect(structured.code).not.toBe("AUTH_FAILED");
+  });
+});
+
+
+// ─── Issue #39 — composeWriteFileCommand (opencode_write_file) ────────────
+//
+// Backstory: the native opencode `write` tool stalls indefinitely when
+// the LLM tries to stream prose / markdown containing backticks,
+// em-dashes, accented characters, or fenced code blocks through
+// DeepSeek/OpenRouter (and possibly others).  `opencode_write_file`
+// sidesteps the bug by composing a base64-decode shell pipeline that
+// the wrapper assembles in Node — the LLM never produces the file
+// content as a tool call argument.
+//
+// These tests assert the safety properties of the generated command:
+//   1. Base64 round-trip preserves Unicode exactly (the actual #39
+//      payload — em-dashes, accents, backticks, fenced cpp).
+//   2. Paths with apostrophes / spaces / parens survive POSIX
+//      single-quote escaping.
+//   3. The generated command contains NO unescaped backticks, so it
+//      passes the `SHELL_CONTENT_REFUSED` guard in `opencode_shell_execute`
+//      (#25 / #28).
+describe("Issue #39 — composeWriteFileCommand (opencode_write_file)", () => {
+  // The exact kind of payload that triggers the upstream stall, packed
+  // into a string that exercises every reported failure mode at once.
+  const ISSUE_39_PAYLOAD = [
+    "# Test Markdown — héritage du bug #39",
+    "",
+    "Voici des caractères piégeux : `code`, `inline`, em-dash (—),",
+    "accents français (éèêëàâçîïôöûüù).",
+    "",
+    "```cpp",
+    "// Block of code that combines all the failure modes",
+    "std::string s = \"héritage — `value`\";",
+    "if (x → y) { /* arrow */ }",
+    "```",
+    "",
+    "End of payload.",
+  ].join("\n");
+
+  it("preserves Unicode exactly through base64 round-trip on the issue #39 payload", () => {
+    const cmd = composeWriteFileCommand("/tmp/test.md", ISSUE_39_PAYLOAD);
+    const match = cmd.match(/printf '%s' '([^']+)'/);
+    expect(match).not.toBeNull();
+    const b64 = match![1];
+    const decoded = Buffer.from(b64, "base64").toString("utf8");
+    expect(decoded).toBe(ISSUE_39_PAYLOAD);
+  });
+
+  it("preserves Unicode for a wide range of code points (CJK, emoji, combining marks, RTL)", () => {
+    const stress = "café — 北京 — ́ (combining acute) — 🚀 — שלום";
+    const cmd = composeWriteFileCommand("/tmp/stress.md", stress);
+    const b64 = cmd.match(/printf '%s' '([^']+)'/)![1];
+    expect(Buffer.from(b64, "base64").toString("utf8")).toBe(stress);
+  });
+
+  it("emits NO unescaped backticks in the generated command (passes SHELL_CONTENT_REFUSED guard #25)", () => {
+    // The guard in `opencode_shell_execute` is `/(?<!\\)` + backtick`.
+    // Any unescaped backtick triggers refusal.  Our composed command
+    // must never contain one regardless of input content.
+    const cmd = composeWriteFileCommand(
+      "/tmp/file.md",
+      "lots of `backticks` and ```fenced``` blocks",
+    );
+    expect(/(?<!\\)`/.test(cmd)).toBe(false);
+  });
+
+  it("escapes single quotes in the file path using POSIX close-escape-reopen", () => {
+    const cmd = composeWriteFileCommand("/tmp/it's a file.md", "hello");
+    // Expected fragment: `> '/tmp/it'\''s a file.md'` (close, escape,
+    // reopen single quote).
+    expect(cmd).toContain("> '/tmp/it'\\''s a file.md'");
+  });
+
+  it("survives paths with spaces and parens without word-splitting", () => {
+    const cmd = composeWriteFileCommand(
+      "/tmp/folder (v2)/My File.md",
+      "x",
+    );
+    expect(cmd).toContain("> '/tmp/folder (v2)/My File.md'");
+  });
+
+  it("emits a redirection to the requested path (no trailing junk)", () => {
+    const cmd = composeWriteFileCommand("/tmp/out.md", "hi");
+    // Structure: printf '%s' '<b64>' | base64 -d > '<path>'
+    expect(cmd).toMatch(
+      /^printf '%s' '[A-Za-z0-9+/=]+' \| base64 -d > '\/tmp\/out\.md'$/,
+    );
+  });
+
+  it("handles an empty content string (produces a valid command writing an empty file)", () => {
+    const cmd = composeWriteFileCommand("/tmp/empty.md", "");
+    expect(cmd).toBe("printf '%s' '' | base64 -d > '/tmp/empty.md'");
+    expect(/(?<!\\)`/.test(cmd)).toBe(false);
+  });
+
+  it("base64 output uses only the standard alphabet (no shell metacharacters)", () => {
+    // The base64 alphabet [A-Za-z0-9+/=] contains zero characters
+    // requiring shell escaping inside single quotes — this is what
+    // lets the outer single-quote wrapper be safe regardless of input.
+    const cmd = composeWriteFileCommand(
+      "/tmp/x",
+      "any content with `quotes` and 'apostrophes'",
+    );
+    const b64 = cmd.match(/printf '%s' '([^']+)'/)![1];
+    expect(b64).toMatch(/^[A-Za-z0-9+/]+={0,2}$/);
   });
 });
