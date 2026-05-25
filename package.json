@@ -1,6 +1,6 @@
 {
   "name": "@mekareteriker/opencode-mcp",
-  "version": "1.13.0-mekareteriker.0",
+  "version": "1.14.0-mekareteriker.0",
   "description": "Hardened fork of opencode-mcp — Windows-compatible directory validation, structured errors, idempotency. Drop-in replacement for the upstream package.",
   "type": "module",
   "main": "dist/index.js",

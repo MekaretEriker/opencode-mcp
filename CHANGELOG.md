@@ -9,6 +9,33 @@ Fork notation: entries tagged `[upstream]` were cherry-picked or carried forward
 [AlaeddineMessadi/opencode-mcp](https://github.com/AlaeddineMessadi/opencode-mcp).
 Entries tagged `[fork]` are specific to `@mekareteriker/opencode-mcp`.
 
+## [1.14.0-mekareteriker.0] - 2026-05-25
+
+### Added
+
+- `[fork]` **#39 — `opencode_write_file` tool: file-first wrapper that bypasses the upstream `write` tool stall.** The native opencode `write` tool stalls indefinitely on prose/markdown payloads containing backticks, em-dashes, accented characters, or fenced code blocks when dispatched through DeepSeek/OpenRouter (`deepseek-v4-pro`, `deepseek-v4-flash` both reproduced — see issue body for full repro). The bug is upstream OpenCode (`packages/opencode/src/tool/write.ts` — buffer the entire streamed `content` argument before materialization, AND the JSON stream never closes properly on certain payloads), but the symptom surfaces through our wrapper because we expose `session/shell` as our only escape hatch.
+
+  **New tool:** `opencode_write_file({ sessionId, path, content, agent, providerID?, modelID?, variant?, directory? })`.
+
+  **How it works:**
+  - Content is base64-encoded in Node (via `Buffer.from(content, "utf8").toString("base64")`) — never enters the LLM tool-call stream.
+  - The wrapper composes `printf '%s' '<BASE64>' | base64 -d > <quoted-path>` and dispatches via `session.session.shell()`.
+  - The composed command contains zero unescaped backticks, so it passes the `SHELL_CONTENT_REFUSED` guard from #25/#28.
+  - The file path is single-quoted with POSIX close-escape-reopen (the 4-char sequence `'\''`), so paths with spaces, apostrophes, or parens all work.
+  - `printf '%s'` is preferred over `echo` because POSIX `echo` behavior with backslash sequences is implementation-defined.
+
+  **Why this is the right shape (not a session-side SDK route):** the opencode SDK (`@opencode-ai/sdk@1.15.3`) does NOT expose `session.file.write` or any equivalent direct-write route. `session.shell` is the only documented surface that materializes server-side state, and it is already battle-tested in `opencode_shell_execute`. The base64 round-trip is the same workaround Relkhon was applying by hand at the Cowork orchestration layer — sedimenting it into the wrapper eliminates the repeat-yourself tax.
+
+  **Cross-reference with Hermes:** `zaycruz/hermes-opencode-plugin` does not implement a similar workaround because it sidesteps the bug by architecture (Hermes keeps small file writes on its own side via native `terminal` / `read_file` tools, never delegating prose-heavy writes to OpenCode). Our wrapper lives in a different position in the stack — Cowork has no equivalent of Hermes's `terminal` tool — so the workaround needs to be a first-class MCP tool here.
+
+  **Helper extraction:** the encoding + quoting logic lives in `composeWriteFileCommand(filePath, content)` in `helpers.ts`, exported for unit testing in isolation from SDK / network. Tests (`tests/helpers.test.ts`) cover: Unicode round-trip on the exact issue #39 payload, CJK + emoji + combining marks + RTL stress test, backtick-free guarantee on the generated command, single-quote escaping in paths, paths with spaces/parens, empty content, and base64-alphabet-only output.
+
+  **Usage from Cowork / skills:** prefer `opencode_write_file` over delegating to the LLM's native `write` tool whenever the content is prose/markdown ≥ 30 lines OR contains any of: backticks, em-dashes, accented characters, fenced code blocks. The downstream `opencode-agent` skill update teaches the orchestrator to make that choice automatically (see opencode-agent CHANGELOG for the matching minor bump).
+
+  **Tests:** `tests/helpers.test.ts` adds the `describe("Issue #39 — composeWriteFileCommand (opencode_write_file)")` block with 8 tests covering encoding, escaping, and shell-safety properties. Full suite: **383 passed / 11 skipped / 0 failed across 7 files** (was 375 from #33). Net +8 from #39's 8 new tests.
+
+  Closes #39.
+
 ## [1.13.0-mekareteriker.0] - 2026-05-22
 
 ### Fixed
